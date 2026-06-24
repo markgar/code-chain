@@ -1,0 +1,5 @@
+# Flight-recorder output written by the extension into any project it runs in
+.code-chain/
+
+# Node
+node_modules/
