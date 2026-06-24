@@ -38,15 +38,21 @@ across all your projects — no per-repo setup, no path assumptions.
 
 ### What it writes
 
-Into `.code-chain/` of whatever project is active:
+Each **run** (one session) gets its own folder under `.code-chain/runs/<run-id>/` in
+whatever project is active, so trials are preserved and comparable instead of
+overwriting each other. A `.code-chain/latest` symlink always points at the most
+recent run (`cat .code-chain/latest/timeline.log`).
 
-| File | Contents |
+| File (per run) | Contents |
 |------|----------|
-| `timeline.log` | One ordered line per event — the flight recorder for a whole run |
+| `timeline.log` | One ordered line per event — the flight recorder for the whole run |
 | `metrics.csv` | Machine-readable per-event metrics (stage, model, token estimates, status) |
 | `plan.md` / `review.md` | Latest plan / plan-review and latest code-review (prompt + result) |
 | `events.log` | Append-only full history of every stage's I/O |
 | `debug.log` | Low-level extension debug output |
+
+The run id is time-sortable and tagged with the session id
+(`YYYY-MM-DD_HH-MM-SS_<sid8>`), so `ls .code-chain/runs/` lists trials in order.
 
 > Token counts are **estimates** (~4 chars/token) computed from the prompt/result text,
 > because local sub-agent sessions aren't reliably flushed to the session store. Add

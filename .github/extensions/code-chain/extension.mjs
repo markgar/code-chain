@@ -1,6 +1,18 @@
 import { joinSession } from "@github/copilot-sdk/extension";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
+
+// A "run" == one extension/session process. Every stage of a session lands in the
+// same per-run folder under .code-chain/runs/<RUN_ID>/ so each trial is preserved
+// and comparable, instead of the latest run overwriting plan.md / review.md and
+// re-using one timeline. RUN_ID is time-sortable and tagged with the session id.
+const RUN_STARTED = new Date();
+const SESSION_ID = process.env.SESSION_ID || "";
+const RUN_ID = (() => {
+  const ts = RUN_STARTED.toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  const sid = SESSION_ID ? SESSION_ID.slice(0, 8) : Math.random().toString(36).slice(2, 10);
+  return `${ts}_${sid}`;
+})();
 
 // PORTABLE BY DESIGN: this extension does not assume it lives inside the repo it
 // observes. Every hook input carries `workingDirectory` — the active session's
@@ -8,12 +20,14 @@ import { join } from "path";
 // is currently active. That means the SAME installed copy works at user scope
 // (one install, all projects) or project scope, with no path assumptions.
 //
-//   .code-chain/debug.log    — low-level extension debug output
-//   .code-chain/plan.md      — latest plan / plan-review (prompt + result)
-//   .code-chain/review.md    — latest code-review (prompt + result)
-//   .code-chain/events.log   — append-only history of every stage's full I/O
-//   .code-chain/timeline.log — one ordered line per event (the flight recorder)
-//   .code-chain/metrics.csv  — machine-readable per-event metrics for analysis
+// Each run (one session) writes into its own .code-chain/runs/<RUN_ID>/ folder,
+// and .code-chain/latest symlinks to the most recent run:
+//   runs/<RUN_ID>/debug.log    — low-level extension debug output
+//   runs/<RUN_ID>/plan.md      — latest plan / plan-review (prompt + result)
+//   runs/<RUN_ID>/review.md    — latest code-review (prompt + result)
+//   runs/<RUN_ID>/events.log   — append-only history of every stage's full I/O
+//   runs/<RUN_ID>/timeline.log — one ordered line per event (the flight recorder)
+//   runs/<RUN_ID>/metrics.csv  — machine-readable per-event metrics for analysis
 
 // Resolve (and create) the .code-chain dir for the active project. Falls back to
 // process.cwd() only if a hook ever omits workingDirectory.
@@ -24,6 +38,36 @@ function chainDir(workingDirectory) {
     mkdirSync(dir, { recursive: true });
   } catch (e) {
     // ignore
+  }
+  return dir;
+}
+
+// Per-run directory: .code-chain/runs/<RUN_ID>/ inside the active project. Also
+// refreshes a convenient .code-chain/latest pointer to the current run so
+// `cat .code-chain/latest/timeline.log` always shows the most recent trial.
+function runDir(workingDirectory) {
+  const base = chainDir(workingDirectory);
+  const dir = join(base, "runs", RUN_ID);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    // ignore
+  }
+  try {
+    const link = join(base, "latest");
+    try {
+      rmSync(link, { force: true });
+    } catch (e) {
+      // ignore
+    }
+    symlinkSync(join("runs", RUN_ID), link);
+  } catch (e) {
+    // symlinks may be unavailable on some filesystems; fall back to a text pointer
+    try {
+      writeFileSync(join(base, "latest.txt"), RUN_ID + "\n");
+    } catch (e2) {
+      // ignore
+    }
   }
   return dir;
 }
@@ -219,10 +263,10 @@ const session = await joinSession({
   tools: [],
   hooks: {
     onSessionStart: async (input) => {
-      const dir = chainDir(input && input.workingDirectory);
-      debug(dir, `extension loaded. workingDirectory=${input && input.workingDirectory} cwd=${process.cwd()}`);
-      timeline(dir, "SESSION", `start wd=${input && input.workingDirectory}`);
-      await session.log(`🔗 Code Chain loaded (project: ${input && input.workingDirectory})`);
+      const dir = runDir(input && input.workingDirectory);
+      debug(dir, `extension loaded. run=${RUN_ID} workingDirectory=${input && input.workingDirectory} cwd=${process.cwd()}`);
+      timeline(dir, "SESSION", `start run=${RUN_ID} wd=${input && input.workingDirectory}`);
+      await session.log(`🔗 Code Chain loaded — run ${RUN_ID} → .code-chain/runs/${RUN_ID}/`);
     },
     onUserPromptSubmitted: async (input) => {
       const triggers = ["build", "create", "implement", "make", "add", "refactor", "fix"];
@@ -233,12 +277,12 @@ const session = await joinSession({
     },
     onPostToolUse: async (input) => {
       if (input.toolName === "task") {
-        captureTaskCall(chainDir(input.workingDirectory), input.toolArgs, input.toolResult, true);
+        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, input.toolResult, true);
       }
     },
     onPostToolUseFailure: async (input) => {
       if (input.toolName === "task") {
-        captureTaskCall(chainDir(input.workingDirectory), input.toolArgs, { error: safeStr(input.error) }, false);
+        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, { error: safeStr(input.error) }, false);
       }
     },
   },
