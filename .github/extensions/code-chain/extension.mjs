@@ -409,15 +409,19 @@ const session = await joinSession({
       // playbook — only a deliberate command does.
       const prompt = input.prompt || "";
       const promptLower = prompt.toLowerCase();
-      // WORKER mode (checked FIRST): a child build session whose prompt STARTS with
-      // "code-chain worker". Anchoring to the start is deliberate: a COORDINATOR prompt
-      // often *describes* the worker protocol (mentions "code-chain worker" / "PARENT_RUN=")
-      // in its instructions, so any whole-prompt scan would misclassify the coordinator as a
-      // worker (v10 bug) and suppress child spawning. The coordinator MUST author each child
-      // kickoff to BEGIN with "code-chain worker PARENT_RUN=<coord-run-id>" verbatim, so this
-      // anchored match fires. Engage as a single-chunk worker — NOT a coordinator — and record
+      // WORKER mode (checked FIRST): a child build session. Detected by the marker
+      // "code-chain worker" OR a "PARENT_RUN=" tag appearing ANYWHERE in the prompt — NOT
+      // anchored to the start. Reason (confirmed empirically): a child created with
+      // coordinate_with_creator:true has a parent-identity/reply WRAPPER prepended to its
+      // kickoff, so even though the coordinator authors the child prompt to BEGIN with
+      // "code-chain worker PARENT_RUN=...", the runtime shifts that token off position 0 and
+      // anchored matching (v9/v11) missed real workers. Un-anchored survives the wrapper.
+      // The v10 failure (coordinator self-tripping because its kickoff *describes* the worker
+      // protocol) is avoided by keeping these tokens OUT of the coordinator's own kickoff;
+      // SKILL_CONTEXT carries the child-prompt template as injected context, which never
+      // reaches this trigger. Engage as a single-chunk worker — NOT a coordinator — and record
       // telemetry, stamping the parent run id so this child correlates back to it.
-      if (/^\s*code[-\s]?chain\s+worker\b/.test(promptLower)) {
+      if (/\bcode[-\s]?chain\s+worker\b/.test(promptLower) || /parent_run=/.test(promptLower)) {
         try {
           const dir = runDir(input && input.workingDirectory);
           const m = prompt.match(/PARENT_RUN=(\S+)/);
