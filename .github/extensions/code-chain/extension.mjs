@@ -220,6 +220,9 @@ function captureTaskCall(dir, toolArgs, rawResult, ok) {
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLANNING_DOC = join(EXT_DIR, "PLANNING.md");
 const CODING_DOC = join(EXT_DIR, "CODING.md");
+// Starter that shows the SHAPE of a project ./CONSTITUTION.md. Ships beside the
+// extension; the coordinator consults it to author/validate a project's constitution.
+const CONSTITUTION_TEMPLATE = join(EXT_DIR, "CONSTITUTION.template.md");
 
 const SKILL_CONTEXT = `
 ## Code Chain Workflow (chunked: plan → plan-review → [code → review → fix] per chunk)
@@ -246,6 +249,14 @@ CONSTITUTION says what *THIS* project specifically requires — it is the projec
 of truth. Plans must fit it, code must conform to it, and reviewers flag violations as
 blocking. (A project may also drop its own \`./PLANNING.md\` or \`./CODING.md\` to
 EXTEND — never relax — the baselines.)
+
+If the target repo has NO \`./CONSTITUTION.md\`, the project's stack/domain/invariants are
+undeclared. A template showing the SHAPE of one ships at ${CONSTITUTION_TEMPLATE} — its
+sections (Stack, Architecture invariants, Domain constraints, Security, Config, Data,
+Errors, Testing, Deployment, Definition of done) are the checklist of what a good
+constitution covers. If the spec makes the project's stack/domain clear, OFFER to scaffold
+a \`./CONSTITUTION.md\` from that template (filled in from the spec) before planning, so this
+and future runs are grounded — but never block on it; proceed from the spec if declined.
 
 Specify the \`model\` on EVERY task call. Default to "claude-sonnet-4.6" for every
 stage; raise an individual stage to a stronger model only when it clearly warrants it.
