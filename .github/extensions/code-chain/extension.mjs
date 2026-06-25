@@ -332,9 +332,21 @@ const session = await joinSession({
     },
     onUserPromptSubmitted: async (input) => {
       if (shouldYield(input && input.workingDirectory)) return;
-      const triggers = ["build", "create", "implement", "make", "add", "refactor", "fix"];
-      const promptLower = input.prompt.toLowerCase();
-      if (triggers.some((t) => promptLower.includes(t))) {
+      // Explicit, legible kickoff: engage ONLY when the prompt STARTS with the
+      // word "code-chain" (also "code chain" / "codechain"), optionally followed
+      // by a colon — e.g. `code-chain: build the API in specs/foo.md`. Anchoring
+      // to the start means merely *mentioning* code-chain (as in this dev/harness
+      // repo, where it comes up constantly) does NOT inject the coordinator
+      // playbook — only a deliberate command does.
+      const promptLower = (input.prompt || "").toLowerCase();
+      if (/^\s*code[-\s]?chain\b:?/.test(promptLower)) {
+        try {
+          await session.log(
+            "🔗 code-chain engaged — this session is now the COORDINATOR (PLAN → PLAN REVIEW → [CODE → REVIEW → FIX] per chunk). Stages run as `task` sub-agents; telemetry → .code-chain/."
+          );
+        } catch (e) {
+          // ignore
+        }
         return { additionalContext: SKILL_CONTEXT };
       }
     },
