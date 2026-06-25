@@ -1,6 +1,19 @@
 import { joinSession } from "@github/copilot-sdk/extension";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
-import { join } from "path";
+import { appendFileSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
+
+// A "run" == one extension/session process. Every stage of a session lands in the
+// same per-run folder under .code-chain/runs/<RUN_ID>/ so each trial is preserved
+// and comparable, instead of the latest run overwriting plan.md / review.md and
+// re-using one timeline. RUN_ID is time-sortable and tagged with the session id.
+const RUN_STARTED = new Date();
+const SESSION_ID = process.env.SESSION_ID || "";
+const RUN_ID = (() => {
+  const ts = RUN_STARTED.toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  const sid = SESSION_ID ? SESSION_ID.slice(0, 8) : Math.random().toString(36).slice(2, 10);
+  return `${ts}_${sid}`;
+})();
 
 // PORTABLE BY DESIGN: this extension does not assume it lives inside the repo it
 // observes. Every hook input carries `workingDirectory` — the active session's
@@ -8,12 +21,14 @@ import { join } from "path";
 // is currently active. That means the SAME installed copy works at user scope
 // (one install, all projects) or project scope, with no path assumptions.
 //
-//   .code-chain/debug.log    — low-level extension debug output
-//   .code-chain/plan.md      — latest plan / plan-review (prompt + result)
-//   .code-chain/review.md    — latest code-review (prompt + result)
-//   .code-chain/events.log   — append-only history of every stage's full I/O
-//   .code-chain/timeline.log — one ordered line per event (the flight recorder)
-//   .code-chain/metrics.csv  — machine-readable per-event metrics for analysis
+// Each run (one session) writes into its own .code-chain/runs/<RUN_ID>/ folder,
+// and .code-chain/latest symlinks to the most recent run:
+//   runs/<RUN_ID>/debug.log    — low-level extension debug output
+//   runs/<RUN_ID>/plan.md      — latest plan / plan-review (prompt + result)
+//   runs/<RUN_ID>/review.md    — latest code-review (prompt + result)
+//   runs/<RUN_ID>/events.log   — append-only history of every stage's full I/O
+//   runs/<RUN_ID>/timeline.log — one ordered line per event (the flight recorder)
+//   runs/<RUN_ID>/metrics.csv  — machine-readable per-event metrics for analysis
 
 // Resolve (and create) the .code-chain dir for the active project. Falls back to
 // process.cwd() only if a hook ever omits workingDirectory.
@@ -24,6 +39,36 @@ function chainDir(workingDirectory) {
     mkdirSync(dir, { recursive: true });
   } catch (e) {
     // ignore
+  }
+  return dir;
+}
+
+// Per-run directory: .code-chain/runs/<RUN_ID>/ inside the active project. Also
+// refreshes a convenient .code-chain/latest pointer to the current run so
+// `cat .code-chain/latest/timeline.log` always shows the most recent trial.
+function runDir(workingDirectory) {
+  const base = chainDir(workingDirectory);
+  const dir = join(base, "runs", RUN_ID);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    // ignore
+  }
+  try {
+    const link = join(base, "latest");
+    try {
+      rmSync(link, { force: true });
+    } catch (e) {
+      // ignore
+    }
+    symlinkSync(join("runs", RUN_ID), link);
+  } catch (e) {
+    // symlinks may be unavailable on some filesystems; fall back to a text pointer
+    try {
+      writeFileSync(join(base, "latest.txt"), RUN_ID + "\n");
+    } catch (e2) {
+      // ignore
+    }
   }
   return dir;
 }
@@ -168,77 +213,164 @@ function captureTaskCall(dir, toolArgs, rawResult, ok) {
   }
 }
 
-const SKILL_CONTEXT = `
-## Code Chain Workflow (4 loops: plan → plan-review → code → code-review)
+// Absolute paths to the baseline docs that ship beside this extension, resolved from
+// the module's own location so they work at user scope or project scope. Sub-agents
+// read these directly. The TARGET project may also keep its own ./CONSTITUTION.md
+// (stack/domain/invariants) and optional ./PLANNING.md / ./CODING.md at its repo root.
+const EXT_DIR = dirname(fileURLToPath(import.meta.url));
+const PLANNING_DOC = join(EXT_DIR, "PLANNING.md");
+const CODING_DOC = join(EXT_DIR, "CODING.md");
+// Starter that shows the SHAPE of a project ./CONSTITUTION.md. Ships beside the
+// extension; the coordinator consults it to author/validate a project's constitution.
+const CONSTITUTION_TEMPLATE = join(EXT_DIR, "CONSTITUTION.template.md");
 
-You are a COORDINATOR. You NEVER write plans or code yourself. You orchestrate FOUR
+const SKILL_CONTEXT = `
+## Code Chain Workflow (chunked: plan → plan-review → [code → review → fix] per chunk)
+
+You are a COORDINATOR. You NEVER write plans or code yourself. You orchestrate
 sub-agents, each spawned with the \`task\` tool run SYNCHRONOUSLY (mode: "sync") so the
 full result returns inline AND the pipeline logger captures each stage's content +
 token cost to .code-chain/.
 
-Specify the \`model\` on EVERY task call. Default to "claude-sonnet-4.6" for all four
-loops; raise an individual loop to a stronger model only when a task clearly warrants
-it. Use the exact \`description\` strings below — the logger classifies stages from them.
+The spec is broken into CHUNKS up front, reviewed ONCE, then each chunk is built,
+reviewed, and fixed in its own short loop before the next chunk starts. Review depth is
+per-CHUNK by default — only HIGH-RISK chunks get deeper per-task review.
 
-### Loop 1 — PLAN
+### House rules (baseline docs ship with code-chain; the project speaks for itself)
+- PLANNING — tenets of a good plan — ${PLANNING_DOC}
+- CODING — the code/quality baseline — ${CODING_DOC}
+Planning stages build to / review against PLANNING; coding stages conform to / review
+against CODING. Each sub-agent reads the doc itself — pass the path in its prompt (below).
+
+EVERY stage also reads the TARGET project's own \`./CONSTITUTION.md\` at its repo root if
+present: its tech stack, architecture invariants, domain constraints, and deployment
+rules. The baselines say how to plan and code well *in general*; the project
+CONSTITUTION says what *THIS* project specifically requires — it is the project's source
+of truth. Plans must fit it, code must conform to it, and reviewers flag violations as
+blocking. (A project may also drop its own \`./PLANNING.md\` or \`./CODING.md\` to
+EXTEND — never relax — the baselines.)
+
+If the target repo has NO \`./CONSTITUTION.md\`, the project's stack/domain/invariants are
+undeclared. A template showing the SHAPE of one ships at ${CONSTITUTION_TEMPLATE} — its
+sections (Stack, Architecture invariants, Domain constraints, Security, Config, Data,
+Errors, Testing, Deployment, Definition of done) are the checklist of what a good
+constitution covers. If the spec makes the project's stack/domain clear, OFFER to scaffold
+a \`./CONSTITUTION.md\` from that template (filled in from the spec) before planning, so this
+and future runs are grounded — but never block on it; proceed from the spec if declined.
+
+Specify the \`model\` on EVERY task call. Default to "claude-sonnet-4.6" for every
+stage; raise an individual stage to a stronger model only when it clearly warrants it.
+Use the exact \`description\` strings below — the logger classifies stages from them.
+
+### Loop 1 — PLAN (spec → chunks)
 task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
-       description: "Plan build steps",
-       prompt: "<Break the task into the natural number of small, dependency-ordered steps. Each step edits exactly ONE file and depends only on earlier steps. Give file path, exact behavior, and order. Do NOT isolate an empty/trivial file (e.g. __init__.py) in its own step — attach it to the next real file. Do NOT state a target number of steps.>" })
+       description: "Plan build chunks",
+       prompt: "FIRST read the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md at the repo root if it exists), and read ./CONSTITUTION.md at the repo root if present to learn the project's tech stack, architecture invariants, and domain constraints. Produce a plan that satisfies every PLANNING tenet AND fits the project's stack/constraints. <Break the task into the natural number of CHUNKS. A chunk is the smallest unit of work that leaves the tree GREEN (compiles + its own tests pass) and is independently committable. For each chunk give: an ordered id/name, the files it touches, a one-line acceptance check (the test or command that proves it green), the spec rule(s) it satisfies, and its dependencies on earlier chunks. Order chunks so each builds only on earlier ones. Mark any chunk that is HIGH-RISK (security boundary, auth, money/coupon/discount math, data migration, concurrency) — these get deeper per-task review later. Do NOT state a target number of chunks.>" })
 
-### Loop 2 — PLAN REVIEW
+### Loop 2 — PLAN REVIEW (review the chunk breakdown ONCE)
 task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
-       description: "Critique the plan",
-       prompt: "PLAN CRITIQUE ONLY — do not write code. Plan: <plan>. Confirm every entity and EVERY business rule maps to BOTH a build step AND a test. Flag: missing requirements, bad ordering, circular-import risks, test-isolation problems, any step bundling >1 file, and any trivial/empty file isolated in its own step. Return concrete revisions." })
-Then fold the critique into a FINAL plan before any building.
+       description: "Critique the chunk plan",
+       prompt: "CHUNK-PLAN CRITIQUE ONLY — do not write code. Review the plan against the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md if present), the project's ./CONSTITUTION.md if present, AND the spec. Plan: <plan>. Confirm every entity and EVERY business rule maps to a chunk AND to a test inside that chunk, and that the plan fits the project's stack/constraints. Flag every rubric or constitution violation: missing requirements, bad ordering, circular-import risk, chunks too large to stay green in one pass, chunks bundling unrelated work, unnamed seams/contracts, wrong stack/dependency choices, and any high-risk chunk that was not marked. Return concrete revisions." })
+Then fold the critique into a FINAL chunk plan before any building.
 
-### Loop 3 — CODE
-task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
-       description: "Write the code",
-       prompt: "Implement this finalized plan. Write each file and make ONE git commit per step with a conventional-commit message. Then create a venv, install deps, run the tests, and report pass/fail counts. Final plan: <final plan>" })
+### Per-chunk loop — run CODE → CODE REVIEW → (FIX) for EACH chunk, in order
+Do NOT start a chunk until the previous one is green and committed.
+Before each chunk's CODE, record the current HEAD sha (\`git rev-parse HEAD\`) as
+<chunk-base> so the review can diff exactly that chunk.
 
-### Loop 4 — CODE REVIEW
-task({ agent_type: "code-review", model: "claude-sonnet-4.6", mode: "sync",
-       description: "Review the code",
-       prompt: "Review the full diff for bugs, logic errors, race conditions, and any requirement from the plan that was dropped or under-implemented. List issues by severity with concrete fixes." })
-If the reviewer flags blocking issues, dispatch another CODE task to fix them, then re-review.
+  #### CODE (build ONE chunk)
+  task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
+         description: "Build chunk <id>: <name>",
+         prompt: "FIRST read the coding baseline at ${CODING_DOC} (and ./CODING.md at the repo root if it exists) and the project's ./CONSTITUTION.md at the repo root if present, and conform to both. Implement ONLY this chunk: <chunk>. Touch only its listed files plus their tests. Commit per logical step with conventional-commit messages. Then run this chunk's acceptance check and report pass/fail. Earlier chunks are already built and committed — do NOT rebuild them. Final chunk plan for context: <final plan>" })
+
+  #### CODE REVIEW (review THIS chunk's diff only)
+  task({ agent_type: "code-review", model: "claude-sonnet-4.6", mode: "sync",
+         description: "Review chunk <id>: <name>",
+         prompt: "Review ONLY this chunk's diff — \`git diff <chunk-base>..HEAD\` — against the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and the project's ./CONSTITUTION.md if present. Look for bugs, logic errors, races, baseline/constitution violations, and any requirement for THIS chunk that was dropped or under-implemented. Run the chunk's tests. List issues by severity with concrete fixes; treat security/correctness/constitution violations as blocking." })
+  If blocking issues: dispatch another CODE task to fix them, then re-review.
+
+  #### Adaptive depth
+  For a chunk marked HIGH-RISK, split it into tasks and review EACH task's diff (same
+  CODE REVIEW prompt scoped to that task's <task-base>..HEAD). For normal chunks, one
+  review per chunk is enough — do NOT review every file separately.
 
 ### Rules
 - NEVER write plans or code yourself — every stage is a \`task\` sub-agent.
 - Specify model + mode "sync" on every task call. Default model "claude-sonnet-4.6".
-- Do NOT anchor a step count in any prompt (e.g. "~5-7 steps") — it biases the planner toward that number. Let the work decide.
-- A clean build does NOT imply correct code: always run Loop 4, and treat dropped requirements / races as blocking.
-- After Loop 4 passes, read .code-chain/metrics.csv and report per-stage and total token cost, plus a short quality summary.
+- Planning stages obey PLANNING; coding stages obey CODING; every stage also honors the target project's ./CONSTITUTION.md (stack/domain/invariants) when present. Project-root docs extend the baselines.
+- Review per CHUNK by default, not per file. Escalate to per-task review ONLY for HIGH-RISK chunks.
+- Do NOT anchor a chunk count in any prompt — let the work decide.
+- A clean build does NOT imply correct code: review every chunk; treat dropped requirements / races as blocking.
+- Each chunk must be green + committed before the next chunk starts.
+- After the LAST chunk, read .code-chain/metrics.csv and report per-stage AND per-chunk token cost, total cost, plus a short quality summary.
 
 ### Benchmarking builders
-To compare builders, vary ONLY the CODE loop's \`model\` and keep PLAN, PLAN_REVIEW,
+To compare builders, vary ONLY the CODE stage's \`model\` and keep PLAN, PLAN_REVIEW,
 and CODE_REVIEW constant — so planning and review quality stay fixed while you measure
-the coder. Every run's per-stage tokens land in .code-chain/metrics.csv for comparison.
+the coder. Every stage's per-chunk tokens land in .code-chain/metrics.csv for comparison.
 `;
+
+// Scope arbitration: a project-scope copy of code-chain (vendored in the active
+// project's .github/extensions/code-chain/) always WINS over the user/global install.
+// Without this, both copies load in the dev repo and every hook fires twice — doubled
+// telemetry and a SKILL_CONTEXT injected twice. So if THIS instance does not live
+// inside the active project yet a project-scope copy is present there, this instance
+// yields: it registers its hooks but every hook no-ops, writing nothing and injecting
+// nothing. Decided once per session and cached.
+let YIELDED = null;
+function shouldYield(workingDirectory) {
+  if (YIELDED !== null) return YIELDED;
+  try {
+    const wd = workingDirectory || process.cwd();
+    const projectExt = join(wd, ".github", "extensions", "code-chain");
+    const inRepo = EXT_DIR === projectExt || EXT_DIR.startsWith(wd + "/");
+    YIELDED = !inRepo && existsSync(projectExt);
+  } catch (e) {
+    YIELDED = false;
+  }
+  return YIELDED;
+}
 
 const session = await joinSession({
   tools: [],
   hooks: {
     onSessionStart: async (input) => {
-      const dir = chainDir(input && input.workingDirectory);
-      debug(dir, `extension loaded. workingDirectory=${input && input.workingDirectory} cwd=${process.cwd()}`);
-      timeline(dir, "SESSION", `start wd=${input && input.workingDirectory}`);
-      await session.log(`🔗 Code Chain loaded (project: ${input && input.workingDirectory})`);
+      if (shouldYield(input && input.workingDirectory)) return;
+      const dir = runDir(input && input.workingDirectory);
+      debug(dir, `extension loaded. run=${RUN_ID} workingDirectory=${input && input.workingDirectory} cwd=${process.cwd()}`);
+      timeline(dir, "SESSION", `start run=${RUN_ID} wd=${input && input.workingDirectory}`);
+      await session.log(`🔗 Code Chain loaded — run ${RUN_ID} → .code-chain/runs/${RUN_ID}/`);
     },
     onUserPromptSubmitted: async (input) => {
-      const triggers = ["build", "create", "implement", "make", "add", "refactor", "fix"];
-      const promptLower = input.prompt.toLowerCase();
-      if (triggers.some((t) => promptLower.includes(t))) {
+      if (shouldYield(input && input.workingDirectory)) return;
+      // Explicit, legible kickoff: engage ONLY when the prompt STARTS with the
+      // word "code-chain" (also "code chain" / "codechain"), optionally followed
+      // by a colon — e.g. `code-chain: build the API in specs/foo.md`. Anchoring
+      // to the start means merely *mentioning* code-chain (as in this dev/harness
+      // repo, where it comes up constantly) does NOT inject the coordinator
+      // playbook — only a deliberate command does.
+      const promptLower = (input.prompt || "").toLowerCase();
+      if (/^\s*code[-\s]?chain\b:?/.test(promptLower)) {
+        try {
+          await session.log(
+            "🔗 code-chain engaged — this session is now the COORDINATOR (PLAN → PLAN REVIEW → [CODE → REVIEW → FIX] per chunk). Stages run as `task` sub-agents; telemetry → .code-chain/."
+          );
+        } catch (e) {
+          // ignore
+        }
         return { additionalContext: SKILL_CONTEXT };
       }
     },
     onPostToolUse: async (input) => {
+      if (shouldYield(input && input.workingDirectory)) return;
       if (input.toolName === "task") {
-        captureTaskCall(chainDir(input.workingDirectory), input.toolArgs, input.toolResult, true);
+        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, input.toolResult, true);
       }
     },
     onPostToolUseFailure: async (input) => {
+      if (shouldYield(input && input.workingDirectory)) return;
       if (input.toolName === "task") {
-        captureTaskCall(chainDir(input.workingDirectory), input.toolArgs, { error: safeStr(input.error) }, false);
+        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, { error: safeStr(input.error) }, false);
       }
     },
   },
