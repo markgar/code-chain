@@ -409,13 +409,15 @@ const session = await joinSession({
       // playbook — only a deliberate command does.
       const prompt = input.prompt || "";
       const promptLower = prompt.toLowerCase();
-      // WORKER mode (checked FIRST): a child build session. Detected by an unambiguous
-      // worker marker ANYWHERE in the prompt — the literal phrase "code-chain worker" or a
-      // "PARENT_RUN=" tag — NOT an anchored start. The coordinator is an LLM and may reword
-      // or prefix the kickoff so it no longer begins with the marker, so anchoring missed
-      // real workers (v9 bug). Engage as a single-chunk worker — NOT a coordinator — and
-      // record telemetry, stamping the parent run id so this child correlates back to it.
-      if (/\bcode[-\s]?chain\s+worker\b/.test(promptLower) || /parent_run=/.test(promptLower)) {
+      // WORKER mode (checked FIRST): a child build session whose prompt STARTS with
+      // "code-chain worker". Anchoring to the start is deliberate: a COORDINATOR prompt
+      // often *describes* the worker protocol (mentions "code-chain worker" / "PARENT_RUN=")
+      // in its instructions, so any whole-prompt scan would misclassify the coordinator as a
+      // worker (v10 bug) and suppress child spawning. The coordinator MUST author each child
+      // kickoff to BEGIN with "code-chain worker PARENT_RUN=<coord-run-id>" verbatim, so this
+      // anchored match fires. Engage as a single-chunk worker — NOT a coordinator — and record
+      // telemetry, stamping the parent run id so this child correlates back to it.
+      if (/^\s*code[-\s]?chain\s+worker\b/.test(promptLower)) {
         try {
           const dir = runDir(input && input.workingDirectory);
           const m = prompt.match(/PARENT_RUN=(\S+)/);
