@@ -301,11 +301,13 @@ Run the task sub-agents directly on your own worktree:
 Spawn an isolated worker SESSION per chunk so they build concurrently, each in its own
 worktree branched off YOUR branch:
 
-  For each chunk in the wave:
+  Read YOUR coordinator run id ONCE: \`cat .code-chain/latest.txt\` → <coord-run-id>; pass it
+  to every child as PARENT_RUN=<coord-run-id> so each child's telemetry correlates back to
+  this run. For each chunk in the wave:
   create_session({ project_id: "<THIS project's id>", base_branch: "<your current branch>",
      name: "cc <id> · <short name>", notify_on_idle: "once", coordinate_with_creator: true,
      kickoff: { mode: "autopilot", model: "claude-sonnet-4.6",
-       prompt: "code-chain WORKER — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` (dispatch a code-review task, model gpt-5.4-mini) and FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
+       prompt: "code-chain worker PARENT_RUN=<coord-run-id> — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` (dispatch a code-review task, model gpt-5.4-mini) and FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
   Record each child's chunk id + branch (\`get_session\`).
 
   BARRIER — wait for the whole wave. End your turn; each child reports via message (and an
@@ -343,6 +345,26 @@ worktree branched off YOUR branch:
 To compare builders, vary ONLY the CODE stage's \`model\` and keep PLAN, PLAN_REVIEW,
 and CODE_REVIEW constant — so planning and review quality stay fixed while you measure
 the coder. Every stage's per-chunk tokens land in .code-chain/metrics.csv for comparison.
+`;
+
+// Injected into a CHILD WORKER session (one spawned per chunk in a width>1 wave). Unlike
+// SKILL_CONTEXT this does NOT make the session a coordinator — it builds exactly one chunk,
+// records its own stage telemetry, and reports back. Engaged when a prompt starts with
+// "code-chain worker" (checked BEFORE the coordinator trigger).
+const WORKER_CONTEXT = `
+## Code Chain — WORKER (build ONE chunk; you are NOT a coordinator)
+You are a code-chain WORKER session. Do EXACTLY what your kickoff prompt assigns: build the
+ONE chunk it names and nothing else. You are NOT a coordinator — do NOT plan, do NOT break
+work into waves, do NOT spawn sub-sessions, do NOT merge.
+- Read the coding baseline at ${CODING_DOC} (and ./CODING.md at the repo root if present) and
+  the project's ./CONSTITUTION.md if present; conform to both.
+- Touch ONLY the files your chunk OWNS, plus their tests — never a file owned by another chunk.
+- Commit per logical step with conventional-commit messages.
+- Run your chunk's acceptance check; then code-review your OWN diff and FIX blocking issues
+  until green, using the models named in your kickoff. HIGH-RISK chunk → review per task.
+- When green + committed, report back to your coordinator EXACTLY as your kickoff instructs.
+Every CODE/REVIEW step is still a \`task\` sub-agent, so this worker session's .code-chain/
+records its own stage telemetry (correlated to the parent run via PARENT_RUN).
 `;
 
 // Scope arbitration: a project-scope copy of code-chain (vendored in the active
@@ -384,11 +406,32 @@ const session = await joinSession({
       // to the start means merely *mentioning* code-chain (as in this dev/harness
       // repo, where it comes up constantly) does NOT inject the coordinator
       // playbook — only a deliberate command does.
-      const promptLower = (input.prompt || "").toLowerCase();
+      const prompt = input.prompt || "";
+      const promptLower = prompt.toLowerCase();
+      // WORKER mode (checked FIRST): a child build session whose prompt starts with
+      // "code-chain worker". Engage as a single-chunk worker — NOT a coordinator — and
+      // record telemetry, stamping the parent run id (PARENT_RUN=<id>) so this child's
+      // run dir correlates back to the coordinator run.
+      if (/^\s*code[-\s]?chain\s+worker\b/.test(promptLower)) {
+        try {
+          const dir = runDir(input && input.workingDirectory);
+          const m = prompt.match(/PARENT_RUN=(\S+)/);
+          if (m) {
+            try { writeFileSync(join(dir, "parent.txt"), m[1] + "\n"); } catch (e) { /* ignore */ }
+          }
+          timeline(dir, "WORKER", `engaged run=${RUN_ID} parent=${m ? m[1] : "?"}`);
+          await session.log(
+            `🔧 code-chain WORKER — building one chunk; telemetry → .code-chain/runs/${RUN_ID}/ (parent=${m ? m[1] : "?"})`
+          );
+        } catch (e) {
+          // ignore
+        }
+        return { additionalContext: WORKER_CONTEXT };
+      }
       if (/^\s*code[-\s]?chain\b:?/.test(promptLower)) {
         try {
           await session.log(
-            "🔗 code-chain engaged — this session is now the COORDINATOR (PLAN → PLAN REVIEW → [CODE → REVIEW → FIX] per chunk). Stages run as `task` sub-agents; telemetry → .code-chain/."
+            "🔗 code-chain engaged — this session is now the COORDINATOR (PLAN → PLAN REVIEW → [CODE → REVIEW → FIX] per chunk/wave). Stages run as `task` sub-agents; telemetry → .code-chain/."
           );
         } catch (e) {
           // ignore
