@@ -24,7 +24,8 @@ This is the **stack-agnostic baseline** that ships with code-chain. A project ma
 
 ## 2. Chunking
 
-- **Right-sized.** Each chunk is the smallest unit that still leaves the tree green and is independently committable — big enough to be coherent, small enough to review in one pass. A chunk that can't go green in one pass is too big; a trivial/empty file on its own is too small (attach it to the chunk that uses it).
+- **Right-sized by risk.** A chunk is **as large as it can be** while still leaving the tree green, staying independently committable, and reviewable in one pass — *not* the smallest possible slice. Low-risk, same-layer, mutually-independent units are merged into one chunk; a leaf utility or pure-function file never gets its own chunk. HIGH-RISK units go the other way: isolated, and split finer for deeper review. **Loop count should track risk, not file count.**
+- **One acceptance check per chunk.** A chunk proves itself green with a *single* acceptance check. Needing more than one independent check — or spanning more than one layer, bundling independently-failing rules, or combining two risk surfaces — means it's too big; split at the seam. A check that's trivially satisfiable (a leaf utility with no independent risk) means it's too small; merge it into the chunk that uses it.
 - **One concern per chunk.** A chunk does one coherent thing; it never bundles unrelated work to save a step.
 - **Independently verifiable.** Each chunk names its acceptance check — the exact test or command that proves it green — so "done" is observable, not asserted.
 
