@@ -31,11 +31,13 @@ This is the **stack-agnostic baseline** that ships with code-chain. A project ma
 
 ---
 
-## 3. Ordering & dependencies
+## 3. Ordering, dependencies & parallel waves
 
 - **Dependency-ordered.** Each chunk builds only on chunks before it. No forward references, no cycles.
 - **Contracts named at the seams.** Where one chunk depends on another, the plan states the interface between them (types, function signatures, schemas, routes) so chunks compose instead of colliding.
 - **Sequenced for early validation.** Foundational and high-risk assumptions are scheduled early, so the riskiest unknowns are proven (or disproven) before later work piles on top of them.
+- **Grouped into waves.** Chunks are grouped into ordered *waves*: a wave holds chunks that depend only on earlier waves and can therefore build together. A wave may hold a single chunk. Waves expose the parallelism already implied by the dependency graph.
+- **File ownership is exclusive.** Every chunk owns a disjoint set of files — no two chunks write the same file, especially within a wave (a shared file means a guaranteed merge conflict). For new code the plan engineers this by structure: per-entity modules, one router/module file per chunk, and an auto-include/registration seam so chunks never co-edit a shared app/models/router-registry file; unavoidable shared scaffold is created once in an early width-1 wave that later waves only import, never edit. In an EXISTING codebase the plan first inspects the current structure and, wherever multiple chunks would touch a pre-existing shared file, either repartitions by file/region or sequences the colliding chunks into different waves rather than parallelizing them — same-wave chunks never edit the same file, new or existing.
 
 ---
 
