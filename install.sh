@@ -102,10 +102,10 @@ cat <<'EOF'
 
 Done. code-chain is now installed at USER scope and active in every project.
 
-Scope hygiene: do NOT also commit code-chain into a project's .github/extensions/
-— a repo with both a user-scope and project-scope copy double-loads and double-
-writes its logs. Use ONE scope per project (user scope here; project scope only
-for this dev repo, where you edit the source).
+Scope arbitration: a project that vendors its own copy in .github/extensions/
+code-chain/ (like this dev repo) WINS — the user-scope copy detects the project
+copy and yields, so hooks fire once and logs aren't doubled. Everywhere else, the
+user-scope copy runs. No manual per-repo toggling needed.
 
 Reload extensions in any running session to pick up the new version.
 EOF
