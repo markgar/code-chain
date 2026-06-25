@@ -215,7 +215,8 @@ function captureTaskCall(dir, toolArgs, rawResult, ok) {
 
 // Absolute paths to the baseline docs that ship beside this extension, resolved from
 // the module's own location so they work at user scope or project scope. Sub-agents
-// read these directly; a project may add its own ./PLANNING.md or ./CODING.md to extend.
+// read these directly. The TARGET project may also keep its own ./CONSTITUTION.md
+// (stack/domain/invariants) and optional ./PLANNING.md / ./CODING.md at its repo root.
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLANNING_DOC = join(EXT_DIR, "PLANNING.md");
 const CODING_DOC = join(EXT_DIR, "CODING.md");
@@ -232,13 +233,19 @@ The spec is broken into CHUNKS up front, reviewed ONCE, then each chunk is built
 reviewed, and fixed in its own short loop before the next chunk starts. Review depth is
 per-CHUNK by default — only HIGH-RISK chunks get deeper per-task review.
 
-### House rules (two baseline docs ship with code-chain)
+### House rules (baseline docs ship with code-chain; the project speaks for itself)
 - PLANNING — tenets of a good plan — ${PLANNING_DOC}
 - CODING — the code/quality baseline — ${CODING_DOC}
 Planning stages build to / review against PLANNING; coding stages conform to / review
 against CODING. Each sub-agent reads the doc itself — pass the path in its prompt (below).
-If the target project has its own ./PLANNING.md or ./CODING.md at its repo root, read that
-too — project docs EXTEND, never relax, the baselines.
+
+EVERY stage also reads the TARGET project's own \`./CONSTITUTION.md\` at its repo root if
+present: its tech stack, architecture invariants, domain constraints, and deployment
+rules. The baselines say how to plan and code well *in general*; the project
+CONSTITUTION says what *THIS* project specifically requires — it is the project's source
+of truth. Plans must fit it, code must conform to it, and reviewers flag violations as
+blocking. (A project may also drop its own \`./PLANNING.md\` or \`./CODING.md\` to
+EXTEND — never relax — the baselines.)
 
 Specify the \`model\` on EVERY task call. Default to "claude-sonnet-4.6" for every
 stage; raise an individual stage to a stronger model only when it clearly warrants it.
@@ -247,12 +254,12 @@ Use the exact \`description\` strings below — the logger classifies stages fro
 ### Loop 1 — PLAN (spec → chunks)
 task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
        description: "Plan build chunks",
-       prompt: "FIRST read the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md at the repo root if it exists) and produce a plan that satisfies every tenet. <Break the task into the natural number of CHUNKS. A chunk is the smallest unit of work that leaves the tree GREEN (compiles + its own tests pass) and is independently committable. For each chunk give: an ordered id/name, the files it touches, a one-line acceptance check (the test or command that proves it green), the spec rule(s) it satisfies, and its dependencies on earlier chunks. Order chunks so each builds only on earlier ones. Mark any chunk that is HIGH-RISK (security boundary, auth, money/coupon/discount math, data migration, concurrency) — these get deeper per-task review later. Do NOT state a target number of chunks.>" })
+       prompt: "FIRST read the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md at the repo root if it exists), and read ./CONSTITUTION.md at the repo root if present to learn the project's tech stack, architecture invariants, and domain constraints. Produce a plan that satisfies every PLANNING tenet AND fits the project's stack/constraints. <Break the task into the natural number of CHUNKS. A chunk is the smallest unit of work that leaves the tree GREEN (compiles + its own tests pass) and is independently committable. For each chunk give: an ordered id/name, the files it touches, a one-line acceptance check (the test or command that proves it green), the spec rule(s) it satisfies, and its dependencies on earlier chunks. Order chunks so each builds only on earlier ones. Mark any chunk that is HIGH-RISK (security boundary, auth, money/coupon/discount math, data migration, concurrency) — these get deeper per-task review later. Do NOT state a target number of chunks.>" })
 
 ### Loop 2 — PLAN REVIEW (review the chunk breakdown ONCE)
 task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
        description: "Critique the chunk plan",
-       prompt: "CHUNK-PLAN CRITIQUE ONLY — do not write code. Review the plan against the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md if present) AND the spec. Plan: <plan>. Confirm every entity and EVERY business rule maps to a chunk AND to a test inside that chunk. Flag every rubric violation: missing requirements, bad ordering, circular-import risk, chunks too large to stay green in one pass, chunks bundling unrelated work, unnamed seams/contracts, and any high-risk chunk that was not marked. Return concrete revisions." })
+       prompt: "CHUNK-PLAN CRITIQUE ONLY — do not write code. Review the plan against the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md if present), the project's ./CONSTITUTION.md if present, AND the spec. Plan: <plan>. Confirm every entity and EVERY business rule maps to a chunk AND to a test inside that chunk, and that the plan fits the project's stack/constraints. Flag every rubric or constitution violation: missing requirements, bad ordering, circular-import risk, chunks too large to stay green in one pass, chunks bundling unrelated work, unnamed seams/contracts, wrong stack/dependency choices, and any high-risk chunk that was not marked. Return concrete revisions." })
 Then fold the critique into a FINAL chunk plan before any building.
 
 ### Per-chunk loop — run CODE → CODE REVIEW → (FIX) for EACH chunk, in order
@@ -263,12 +270,12 @@ Before each chunk's CODE, record the current HEAD sha (\`git rev-parse HEAD\`) a
   #### CODE (build ONE chunk)
   task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
          description: "Build chunk <id>: <name>",
-         prompt: "FIRST read the coding baseline at ${CODING_DOC} (and ./CODING.md at the repo root if it exists) and conform to it. Implement ONLY this chunk: <chunk>. Touch only its listed files plus their tests. Commit per logical step with conventional-commit messages. Then run this chunk's acceptance check and report pass/fail. Earlier chunks are already built and committed — do NOT rebuild them. Final chunk plan for context: <final plan>" })
+         prompt: "FIRST read the coding baseline at ${CODING_DOC} (and ./CODING.md at the repo root if it exists) and the project's ./CONSTITUTION.md at the repo root if present, and conform to both. Implement ONLY this chunk: <chunk>. Touch only its listed files plus their tests. Commit per logical step with conventional-commit messages. Then run this chunk's acceptance check and report pass/fail. Earlier chunks are already built and committed — do NOT rebuild them. Final chunk plan for context: <final plan>" })
 
   #### CODE REVIEW (review THIS chunk's diff only)
   task({ agent_type: "code-review", model: "claude-sonnet-4.6", mode: "sync",
          description: "Review chunk <id>: <name>",
-         prompt: "Review ONLY this chunk's diff — \`git diff <chunk-base>..HEAD\` — against the coding baseline at ${CODING_DOC} (and ./CODING.md if present). Look for bugs, logic errors, races, baseline violations, and any requirement for THIS chunk that was dropped or under-implemented. Run the chunk's tests. List issues by severity with concrete fixes; treat security/correctness violations as blocking." })
+         prompt: "Review ONLY this chunk's diff — \`git diff <chunk-base>..HEAD\` — against the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and the project's ./CONSTITUTION.md if present. Look for bugs, logic errors, races, baseline/constitution violations, and any requirement for THIS chunk that was dropped or under-implemented. Run the chunk's tests. List issues by severity with concrete fixes; treat security/correctness/constitution violations as blocking." })
   If blocking issues: dispatch another CODE task to fix them, then re-review.
 
   #### Adaptive depth
@@ -279,7 +286,7 @@ Before each chunk's CODE, record the current HEAD sha (\`git rev-parse HEAD\`) a
 ### Rules
 - NEVER write plans or code yourself — every stage is a \`task\` sub-agent.
 - Specify model + mode "sync" on every task call. Default model "claude-sonnet-4.6".
-- Planning stages obey PLANNING; coding stages obey CODING. Project-root docs extend the baselines.
+- Planning stages obey PLANNING; coding stages obey CODING; every stage also honors the target project's ./CONSTITUTION.md (stack/domain/invariants) when present. Project-root docs extend the baselines.
 - Review per CHUNK by default, not per file. Escalate to per-task review ONLY for HIGH-RISK chunks.
 - Do NOT anchor a chunk count in any prompt — let the work decide.
 - A clean build does NOT imply correct code: review every chunk; treat dropped requirements / races as blocking.

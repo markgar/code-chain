@@ -9,6 +9,8 @@
 #   ./install.sh --with-freshness     Also install the branch-freshness helper
 #   ./install.sh --all                Install every extension in this repo
 #   ./install.sh --gitignore <dir>    Add `.code-chain/` to <dir>/.gitignore
+#   ./install.sh --scaffold-constitution <dir>
+#                                     Copy a starter CONSTITUTION.md into <dir> (if absent)
 #   ./install.sh --list               Show installed vs repo versions
 #   ./install.sh --help
 #
@@ -54,6 +56,29 @@ add_gitignore() {
   echo "  ✓ added .code-chain/ to $gi"
 }
 
+# Drop a starter CONSTITUTION.md (the project's stack/domain/invariants, which every
+# pipeline stage reads) into a target repo, from the template that ships with code-chain.
+# Never overwrites an existing one.
+scaffold_constitution() {
+  local dir="$1"
+  local tmpl="$SRC_DIR/code-chain/CONSTITUTION.template.md"
+  local dest="$dir/CONSTITUTION.md"
+  if [ ! -d "$dir" ]; then
+    echo "  ✗ $dir — not a directory" >&2
+    return 1
+  fi
+  if [ ! -f "$tmpl" ]; then
+    echo "  ✗ template not found at $tmpl" >&2
+    return 1
+  fi
+  if [ -f "$dest" ]; then
+    echo "  • $dest already exists — left untouched"
+    return 0
+  fi
+  cp "$tmpl" "$dest"
+  echo "  ✓ wrote starter $dest (fill it in for your project)"
+}
+
 list_versions() {
   echo "Extension versions (repo → installed at $USER_EXT_DIR):"
   for src in "$SRC_DIR"/*/; do
@@ -72,14 +97,16 @@ list_versions() {
 WITH_FRESHNESS=false
 ALL=false
 GITIGNORE_DIRS=()
+CONSTITUTION_DIRS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-freshness|-f) WITH_FRESHNESS=true; shift ;;
     --all) ALL=true; shift ;;
     --gitignore) GITIGNORE_DIRS+=("$2"); shift 2 ;;
+    --scaffold-constitution) CONSTITUTION_DIRS+=("$2"); shift 2 ;;
     --list) list_versions; exit 0 ;;
-    --help|-h) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h) sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -96,6 +123,10 @@ fi
 
 for dir in "${GITIGNORE_DIRS[@]:-}"; do
   [ -n "$dir" ] && add_gitignore "$dir"
+done
+
+for dir in "${CONSTITUTION_DIRS[@]:-}"; do
+  [ -n "$dir" ] && scaffold_constitution "$dir"
 done
 
 cat <<'EOF'
