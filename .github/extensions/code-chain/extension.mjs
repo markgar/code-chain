@@ -139,6 +139,43 @@ function classifyStage({ agentType, description, agentId, prompt }) {
 let SEQ = 0;
 let LAST_TS = Date.now();
 
+// Pending `task` arguments captured at onPreToolUse, keyed by run dir, drained FIFO
+// at onPostToolUse. The host strips the large `prompt` (and `description`) from
+// toolArgs by the time the POST hook fires — which is why every stage logged
+// ptok~0 and desc="". The PRE hook still has the intact args, so we stash them and
+// pair them back up. In-process pipeline stages run sequentially per session, so a
+// per-dir FIFO matches pre→post reliably; this is telemetry, so a rare mismatch
+// under concurrent background tasks only mislabels an estimate, never breaks a build.
+const PENDING_TASK_ARGS = new Map();
+
+function pushPendingTaskArgs(dir, args) {
+  if (!dir) return;
+  const q = PENDING_TASK_ARGS.get(dir) || [];
+  q.push(args || {});
+  // Bound the queue so a pre-without-post leak can never grow without limit.
+  if (q.length > 64) q.shift();
+  PENDING_TASK_ARGS.set(dir, q);
+}
+
+function shiftPendingTaskArgs(dir) {
+  const q = dir && PENDING_TASK_ARGS.get(dir);
+  if (!q || !q.length) return null;
+  return q.shift();
+}
+
+// Backfill prompt/description/agent_type/model from the PRE-hook args (which the
+// host strips from the POST-hook args) so token estimates and stage classification
+// are accurate.
+function mergeTaskArgs(postArgs, preArgs) {
+  const post = postArgs || {};
+  if (!preArgs) return post;
+  const merged = { ...post };
+  for (const k of ["prompt", "description", "agent_type", "model"]) {
+    if (!merged[k] && preArgs[k]) merged[k] = preArgs[k];
+  }
+  return merged;
+}
+
 // Unified, append-only timeline. One ordered line per event with a sequence number
 // and elapsed-since-previous gap. A single `cat timeline.log` reconstructs a run:
 //   SESSION -> PLAN -> PLAN_REVIEW -> CODE -> CODE_REVIEW -> CODE(fix) -> CODE_REVIEW
@@ -307,14 +344,28 @@ worktree branched off YOUR branch:
   create_session({ project_id: "<THIS project's id>", base_branch: "<your current branch>",
      name: "cc W<wave> <id> · <short name>", notify_on_idle: "once", coordinate_with_creator: true,
      kickoff: { mode: "autopilot", model: "claude-sonnet-4.6",
-       prompt: "code-chain worker PARENT_RUN=<coord-run-id> — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` (dispatch a code-review task, model gpt-5.4-mini) and FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
+       prompt: "code-chain worker PARENT_RUN=<coord-run-id> — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` (dispatch a code-review task, model gpt-5.4-mini) and FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, do BOTH of these as your FINAL steps so your coordinator can detect completion even if a message is missed: (1) write a sentinel at your worktree root — \`printf 'CHUNK <id> tests=<pass|fail> branch=%s\\n' \"\$(git rev-parse --abbrev-ref HEAD)\" > .cc-done\` (do NOT commit it); (2) send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
   Record each child's chunk id + branch (\`get_session\`).
 
-  BARRIER — wait for the whole wave. End your turn; each child reports via message (and an
-  idle notification). On every wake, count how many of THIS wave's chunks have reported
-  DONE. If not all, wait again. Do NOT merge anything until ALL wave chunks are DONE.
+  BARRIER — ACTIVELY POLL; do NOT simply end your turn waiting on inbound messages.
+  Passively waiting for each child's DONE message can STALL the whole wave if a
+  message fails to re-wake you (observed failure mode). Instead, drive a poll loop you
+  control. Each child writes a sentinel file \`<child-worktree>/.cc-done\` as its FINAL
+  step (its kickoff instructs this) in ADDITION to sending its DONE message. You hold
+  every child's worktree path from \`get_session\`. Block on a bash loop until all
+  sentinels exist, e.g.:
 
-  MERGE-BACK — when all are DONE, for each child branch in chunk-id order run on YOUR branch:
+    for i in \$(seq 1 160); do n=0; for w in <child-wt-1> <child-wt-2> <child-wt-N>; do
+      test -f "\$w/.cc-done" && n=\$((n+1)); done
+      [ "\$n" -eq <N> ] && { echo ALL_DONE; break; }; sleep 15; done
+
+  If the command times out before ALL_DONE, just run it again (it is idempotent) — keep
+  polling, do NOT give up and do NOT merge early. Treat a child as ready only when its
+  sentinel exists AND its branch has commits beyond <wave-base>. Read each child's DONE
+  message (or its \`.cc-done\` contents) to confirm tests=pass; if a child reports
+  tests=fail or never finishes, send it a corrective message and keep polling.
+
+  MERGE-BACK — when ALL are ready, for each child branch in chunk-id order run on YOUR branch:
   \`git merge --no-ff <child-branch>\`. With clean file ownership these never conflict. If one
   DOES conflict, that is a file-ownership violation: resolve minimally (or dispatch a CODE fix
   task) and record it for the final report.
@@ -364,6 +415,10 @@ work into waves, do NOT spawn sub-sessions, do NOT merge.
 - Run your chunk's acceptance check; then code-review your OWN diff and FIX blocking issues
   until green, using the models named in your kickoff. HIGH-RISK chunk → review per task.
 - When green + committed, report back to your coordinator EXACTLY as your kickoff instructs.
+  As your FINAL steps ALSO write a sentinel file at your worktree root so the coordinator
+  can detect completion by polling even if your message is missed: \`printf 'CHUNK <id>
+  tests=<pass|fail> branch=%s\\n' "\$(git rev-parse --abbrev-ref HEAD)" > .cc-done\` (do NOT
+  commit it), THEN send your DONE message.
 Every CODE/REVIEW step is still a \`task\` sub-agent, so this worker session's .code-chain/
 records its own stage telemetry (correlated to the parent run via PARENT_RUN).
 `;
@@ -448,16 +503,28 @@ const session = await joinSession({
         return { additionalContext: SKILL_CONTEXT };
       }
     },
+    onPreToolUse: async (input) => {
+      if (shouldYield(input && input.workingDirectory)) return;
+      // Stash intact `task` args (the host strips `prompt`/`description` before the
+      // POST hook). Drained FIFO in onPostToolUse so telemetry recovers them.
+      if (input.toolName === "task") {
+        pushPendingTaskArgs(runDir(input.workingDirectory), input.toolArgs);
+      }
+    },
     onPostToolUse: async (input) => {
       if (shouldYield(input && input.workingDirectory)) return;
       if (input.toolName === "task") {
-        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, input.toolResult, true);
+        const dir = runDir(input.workingDirectory);
+        const merged = mergeTaskArgs(input.toolArgs, shiftPendingTaskArgs(dir));
+        captureTaskCall(dir, merged, input.toolResult, true);
       }
     },
     onPostToolUseFailure: async (input) => {
       if (shouldYield(input && input.workingDirectory)) return;
       if (input.toolName === "task") {
-        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, { error: safeStr(input.error) }, false);
+        const dir = runDir(input.workingDirectory);
+        const merged = mergeTaskArgs(input.toolArgs, shiftPendingTaskArgs(dir));
+        captureTaskCall(dir, merged, { error: safeStr(input.error) }, false);
       }
     },
   },
