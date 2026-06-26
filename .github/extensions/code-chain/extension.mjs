@@ -366,7 +366,11 @@ worktree branched off YOUR branch:
      name: "cc W<wave> <id> · <short name>", notify_on_idle: "once", coordinate_with_creator: true,
      kickoff: { mode: "autopilot", model: "claude-sonnet-4.6",
        prompt: "code-chain worker PARENT_RUN=<coord-run-id> — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` (dispatch a code-review task, model gpt-5.4-mini) and FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, do BOTH of these as your FINAL steps so your coordinator can detect completion even if a message is missed: (1) write a sentinel at your worktree root — \`printf 'CHUNK <id> tests=<pass|fail> branch=%s\\n' \"\$(git rev-parse --abbrev-ref HEAD)\" > .cc-done\` (do NOT commit it); (2) send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
-  Record each child's chunk id + branch (\`get_session\`).
+  Record each child's chunk id + branch (\`get_session\`). ALSO append each spawned child's
+  branch (one per line) to \`.code-chain/latest/children.txt\` on YOUR worktree as you create
+  it — this manifest lets the post-run token reconciler attribute child usage to this build
+  reliably even when other builds run concurrently. E.g. per child:
+  \`echo "<child-branch>" >> .code-chain/latest/children.txt\`.
 
   BARRIER — ACTIVELY POLL; do NOT simply end your turn waiting on inbound messages.
   Passively waiting for each child's DONE message can STALL the whole wave if a
@@ -412,7 +416,9 @@ worktree branched off YOUR branch:
 - A clean build does NOT imply correct code: review every chunk; treat dropped requirements / races as blocking.
 - Process the plan WAVE BY WAVE. Each wave must be merged + green + committed on your branch before the next wave starts. Width-1 waves build IN-PROCESS via task; width>1 waves spawn one CHILD SESSION per chunk and merge back, then get one integration review.
 - Child worker sessions must touch ONLY their chunk's OWNED files and must NOT merge — the coordinator owns all merges. Name them "cc W<wave> <id> · <short name>" (wave number in the title); keep "COORD" in your own name. Each child's kickoff prompt MUST begin with the literal token "code-chain worker PARENT_RUN=<coord-run-id>" so the worker trigger fires and telemetry correlates.
-- After the LAST wave, read .code-chain/metrics.csv and report per-stage AND per-chunk/per-wave token cost, total cost, plus a short quality summary. Child-session stages log to their OWN worktree's .code-chain/ — aggregate them from each child's reported result (and, if needed, by reading each child worktree's metrics.csv).
+- After the LAST wave, read .code-chain/metrics.csv and report per-stage AND per-chunk/per-wave token cost, total cost, plus a short quality summary. Child-session stages log to their OWN worktree's .code-chain/ — aggregate them from each child's reported result (and, if needed, by reading each child worktree's metrics.csv). NOTE: metrics.csv tokens are CHAR-COUNT ESTIMATES (host exposes prompt/response length, not real tokens; reasoning tokens are excluded). For REAL billed usage (per-model input/cache/output/reasoning tokens + AIU, reasoning included), run the post-run reconciler — it reads each session's on-disk shutdown modelMetrics:
+  \`node .github/extensions/code-chain/reconcile-tokens.mjs --cwd <coordinator-worktree>\`
+  Width-1 runs are fully captured by the coordinator session alone. For wave-parallel runs, child usage is auto-included from \`.code-chain/latest/children.txt\` (written during spawn); otherwise pass \`--child <branch>\` per worker or \`--auto-children\` (time-window heuristic, unsafe under concurrent builds). The reconciler must run AFTER all sessions have shut down (a session cannot read its own shutdown metrics).
 
 ### Benchmarking builders
 To compare builders, vary ONLY the CODE stage's \`model\` and keep PLAN, PLAN_REVIEW,
