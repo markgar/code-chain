@@ -99,9 +99,14 @@ function estTokens(str) {
   return Math.ceil(String(str).length / 4);
 }
 
-// Pull model / agent_id / exec_mode / any real metrics out of a task tool result.
+// Pull model / agent_id / exec_mode / real char-length counts out of a task result.
+// The host exposes EXACT prompt and response character counts in
+// `toolTelemetry.properties.{prompt_length,response_length}` (as strings) — this is
+// our authoritative token signal. The large `prompt` text itself is stripped from
+// toolArgs, but these length counts always come through, so we estimate tokens
+// directly from them (chars/4) instead of trying to recover the prompt text.
 function extractTelemetry(rawResult) {
-  const t = { model: "", agentId: "", agentType: "", execMode: "", metrics: null };
+  const t = { model: "", agentId: "", agentType: "", execMode: "", metrics: null, promptLen: 0, responseLen: 0, toolCalls: null };
   try {
     const tel = rawResult && rawResult.toolTelemetry;
     if (tel) {
@@ -109,9 +114,16 @@ function extractTelemetry(rawResult) {
       t.model = p.model || "";
       t.agentType = p.agent_type || p.agent_name || "";
       t.execMode = p.execution_mode || "";
+      t.promptLen = Number(p.prompt_length) || 0;
+      t.responseLen = Number(p.response_length) || 0;
       const rp = tel.restrictedProperties || {};
       t.agentId = rp.agent_id || "";
-      if (tel.metrics && Object.keys(tel.metrics).length) t.metrics = tel.metrics;
+      if (tel.metrics && Object.keys(tel.metrics).length) {
+        t.metrics = tel.metrics;
+        if (typeof tel.metrics.numberOfToolCallsMadeByAgent === "number") {
+          t.toolCalls = tel.metrics.numberOfToolCallsMadeByAgent;
+        }
+      }
     }
   } catch (e) {
     // ignore
@@ -119,46 +131,37 @@ function extractTelemetry(rawResult) {
   return t;
 }
 
-// Classify a task call into one of the four pipeline stages from naming signals.
-// The skill instructs the coordinator to use clear `description` strings so this
-// is reliable (PLAN / PLAN_REVIEW / CODE / CODE_REVIEW).
-function classifyStage({ agentType, description, agentId, prompt }) {
-  const hay = `${description} ${agentId} ${agentType} ${String(prompt).slice(0, 200)}`.toLowerCase();
-  const isReview = /review|critique/.test(hay);
-  const isPlan = /plan/.test(hay);
-  const isCode = /code|coder|coding|build|implement|write the/.test(hay);
-  if (isPlan && isReview) return "PLAN_REVIEW";
-  if (isPlan) return "PLAN";
-  if (isReview) return "CODE_REVIEW";
+// Estimate tokens from a raw character count (host-provided lengths are authoritative).
+function tokFromLen(n) {
+  return n > 0 ? Math.ceil(n / 4) : 0;
+}
+
+// Classify a task call into a pipeline stage. The host strips `description` and the
+// `prompt` from toolArgs and omits agent_id for sync tasks, so the only reliable
+// signal left in the post-hook is the model's RESULT text. Reviews announce a verdict
+// (BLOCKING / CHANGES_REQUIRED / APPROVE / LGTM); plans emit a file layout / wave /
+// chunk design; code stages report tests created/passing. This is best-effort — the
+// authoritative per-phase axis is `model` (each pipeline phase uses a distinct model).
+function classifyStage({ resultText, prevStage }) {
+  const hay = String(resultText || "").slice(0, 1200).toLowerCase();
+  const isReview = /blocking|changes_required|changes required|\bverdict\b|\blgtm\b|approve|reject|looks good|review (?:summary|verdict)|non-blocking/.test(hay);
+  const isPlan = /file layout|## models|wave \d|chunk c?\d|directory layout|## file|test cases|boot ?\/ ?startup|## plan/.test(hay);
+  const isCode = /tests? (?:pass|passed|green)|\d+ passed|all \d+ tests|implemented|created under|created the|wrote |files? created|\bpytest\b/.test(hay);
+  if (isReview) {
+    // A review that follows a PLAN is a PLAN_REVIEW; one that follows CODE is CODE_REVIEW.
+    return prevStage === "PLAN" || prevStage === "PLAN_REVIEW" ? "PLAN_REVIEW" : "CODE_REVIEW";
+  }
+  if (isPlan && !isCode) return "PLAN";
   if (isCode) return "CODE";
   return "TASK";
 }
 
 // Per-process ordering counters (reset on extension reload; timestamps still order
-// events across reloads).
+// events across reloads). PREV_STAGE lets a review be attributed to the phase it
+// follows (PLAN_REVIEW vs CODE_REVIEW).
 let SEQ = 0;
 let LAST_TS = Date.now();
-
-// The host strips the large `prompt` from a `task` tool's `toolArgs` in BOTH the pre-
-// and post-tool hooks, so we can't read it from args. But the tool RESULT echoes it
-// back in `sessionLog` as: "Prompt to <type> agent (<id>):\n<the full prompt>" —
-// followed, for a SYNC task, by the agent's transcript. This recovers the prompt text
-// from there so input-token estimates are real instead of 0.
-const PROMPT_HEADER_RE = /^Prompt to .*? agent \([^)]*\):\n/;
-
-function extractPromptFromResult(rawResult, resultText) {
-  try {
-    const log = rawResult && typeof rawResult.sessionLog === "string" ? rawResult.sessionLog : "";
-    if (!log) return "";
-    let p = log.replace(PROMPT_HEADER_RE, "");
-    // For a SYNC task the agent's response is appended after the prompt inside
-    // sessionLog; drop it so we count prompt tokens only, not the echoed result.
-    if (resultText && p.includes(resultText)) p = p.split(resultText)[0];
-    return p.trim();
-  } catch (e) {
-    return "";
-  }
-}
+let PREV_STAGE = "";
 
 // The model's actual returned text. For a SYNC task this is the agent's full answer;
 // for a BACKGROUND dispatch it is just the "Agent started…" ack (correct: a background
@@ -216,15 +219,18 @@ function captureTaskCall(dir, toolArgs, rawResult, ok) {
 
     // The model's actual output (sync: full answer; background: the dispatch ack).
     const resultText = resultOutputText(rawResult);
-    // The host strips `prompt`/`description` from toolArgs in both hooks, so recover
-    // the prompt from the result's sessionLog. Fall back to args if ever present.
-    const prompt = safeStr(args.prompt) || extractPromptFromResult(rawResult, resultText);
-    const description = args.description || tel.agentId || "";
-
-    const stage = classifyStage({ agentType, description, agentId: tel.agentId, prompt });
-    const promptTok = estTokens(prompt);
-    const resultTok = estTokens(resultText);
     const background = (tel.execMode || "").toLowerCase() === "background";
+
+    // Token estimates come from the host's authoritative char counts (prompt_length /
+    // response_length). Fall back to measuring the result text only if absent. The
+    // prompt text itself is stripped from the hook, so we never have it — only its length.
+    const promptTok = tel.promptLen ? tokFromLen(tel.promptLen) : 0;
+    const resultTok = tel.responseLen ? tokFromLen(tel.responseLen) : estTokens(resultText);
+
+    // Classify from the result content (only reliable post-hook signal); a background
+    // dispatch returns only an ack, so it can't be classified — label it DISPATCH.
+    const stage = background ? "DISPATCH" : classifyStage({ resultText, prevStage: PREV_STAGE });
+    if (!background && stage !== "TASK") PREV_STAGE = stage;
     const isReview = stage === "PLAN_REVIEW" || stage === "CODE_REVIEW";
     const named = isReview ? "review.md" : "plan.md";
 
@@ -237,15 +243,18 @@ function captureTaskCall(dir, toolArgs, rawResult, ok) {
       `# ${stage} — ${ts}\n\n` +
       `- stage: ${stage}\n- model: ${model}\n- agent_type: ${agentType}\n` +
       `- agent_id: ${tel.agentId || "(n/a)"}\n- exec_mode: ${tel.execMode || "(n/a)"}\n` +
-      `- description: ${description}\n- status: ${ok ? "success" : "FAILURE"}\n` +
-      `- prompt_tokens_est: ${promptTok}\n- result_tokens_est: ${resultTok}${resultNote}\n` +
+      `- status: ${ok ? "success" : "FAILURE"}\n` +
+      `- prompt_chars: ${tel.promptLen} -> prompt_tokens_est: ${promptTok}\n` +
+      `- result_chars: ${tel.responseLen || (resultText || "").length} -> result_tokens_est: ${resultTok}${resultNote}\n` +
+      (tel.toolCalls != null ? `- agent_tool_calls: ${tel.toolCalls}\n` : "") +
       (tel.metrics ? `- metrics: ${safeStr(tel.metrics)}\n` : "") +
-      `\n## Prompt sent to sub-agent\n\n\`\`\`\n${prompt}\n\`\`\`\n\n` +
-      `## Sub-agent result\n\n${safeStr(rawResult)}\n`;
+      `\n## Note\n\nThe host strips the prompt text from the hook; only its character length\n` +
+      `(prompt_chars above) is available. Token counts are chars/4 estimates.\n\n` +
+      `## Sub-agent result (output)\n\n${resultText}\n`;
 
     writeFileSync(join(dir, named), block);
     appendFileSync(join(dir, "events.log"), `\n${"=".repeat(80)}\n${block}`);
-    timeline(dir, stage, `model=${model} exec=${tel.execMode || "?"} ptok~${promptTok} rtok~${resultTok}${background ? "(bg)" : ""} status=${ok ? "ok" : "FAIL"} desc="${description}"`);
+    timeline(dir, stage, `model=${model} exec=${tel.execMode || "?"} ptok~${promptTok} rtok~${resultTok}${background ? "(bg)" : ""} status=${ok ? "ok" : "FAIL"}`);
     metricRow(dir, { stage, model, agentId: tel.agentId, execMode: tel.execMode, promptTok, resultTok, ok });
   } catch (e) {
     debug(dir, `captureTaskCall error: ${e.message}`);
@@ -309,7 +318,9 @@ and future runs are grounded — but never block on it; proceed from the spec if
 
 Specify the \`model\` on EVERY task call. Default to "claude-sonnet-4.6" for every
 stage; raise an individual stage to a stronger model only when it clearly warrants it.
-Use the exact \`description\` strings below — the logger classifies stages from them.
+The \`model\` is the authoritative per-phase axis in telemetry (the host strips
+\`description\` from the hook, so the logger classifies stages from result content and
+keys cost by model). Keep the \`description\` strings below for your own readability.
 
 ### Loop 1 — PLAN (spec → chunks)
 task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
