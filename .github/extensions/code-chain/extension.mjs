@@ -139,41 +139,33 @@ function classifyStage({ agentType, description, agentId, prompt }) {
 let SEQ = 0;
 let LAST_TS = Date.now();
 
-// Pending `task` arguments captured at onPreToolUse, keyed by run dir, drained FIFO
-// at onPostToolUse. The host strips the large `prompt` (and `description`) from
-// toolArgs by the time the POST hook fires — which is why every stage logged
-// ptok~0 and desc="". The PRE hook still has the intact args, so we stash them and
-// pair them back up. In-process pipeline stages run sequentially per session, so a
-// per-dir FIFO matches pre→post reliably; this is telemetry, so a rare mismatch
-// under concurrent background tasks only mislabels an estimate, never breaks a build.
-const PENDING_TASK_ARGS = new Map();
+// The host strips the large `prompt` from a `task` tool's `toolArgs` in BOTH the pre-
+// and post-tool hooks, so we can't read it from args. But the tool RESULT echoes it
+// back in `sessionLog` as: "Prompt to <type> agent (<id>):\n<the full prompt>" —
+// followed, for a SYNC task, by the agent's transcript. This recovers the prompt text
+// from there so input-token estimates are real instead of 0.
+const PROMPT_HEADER_RE = /^Prompt to .*? agent \([^)]*\):\n/;
 
-function pushPendingTaskArgs(dir, args) {
-  if (!dir) return;
-  const q = PENDING_TASK_ARGS.get(dir) || [];
-  q.push(args || {});
-  // Bound the queue so a pre-without-post leak can never grow without limit.
-  if (q.length > 64) q.shift();
-  PENDING_TASK_ARGS.set(dir, q);
-}
-
-function shiftPendingTaskArgs(dir) {
-  const q = dir && PENDING_TASK_ARGS.get(dir);
-  if (!q || !q.length) return null;
-  return q.shift();
-}
-
-// Backfill prompt/description/agent_type/model from the PRE-hook args (which the
-// host strips from the POST-hook args) so token estimates and stage classification
-// are accurate.
-function mergeTaskArgs(postArgs, preArgs) {
-  const post = postArgs || {};
-  if (!preArgs) return post;
-  const merged = { ...post };
-  for (const k of ["prompt", "description", "agent_type", "model"]) {
-    if (!merged[k] && preArgs[k]) merged[k] = preArgs[k];
+function extractPromptFromResult(rawResult, resultText) {
+  try {
+    const log = rawResult && typeof rawResult.sessionLog === "string" ? rawResult.sessionLog : "";
+    if (!log) return "";
+    let p = log.replace(PROMPT_HEADER_RE, "");
+    // For a SYNC task the agent's response is appended after the prompt inside
+    // sessionLog; drop it so we count prompt tokens only, not the echoed result.
+    if (resultText && p.includes(resultText)) p = p.split(resultText)[0];
+    return p.trim();
+  } catch (e) {
+    return "";
   }
-  return merged;
+}
+
+// The model's actual returned text. For a SYNC task this is the agent's full answer;
+// for a BACKGROUND dispatch it is just the "Agent started…" ack (correct: a background
+// dispatch produces no inline output — that work is billed in the child's own ledger).
+function resultOutputText(rawResult) {
+  if (rawResult && typeof rawResult.textResultForLlm === "string") return rawResult.textResultForLlm;
+  return safeStr(rawResult);
 }
 
 // Unified, append-only timeline. One ordered line per event with a sequence number
@@ -220,30 +212,40 @@ function captureTaskCall(dir, toolArgs, rawResult, ok) {
     const tel = extractTelemetry(rawResult);
     const agentType = args.agent_type || tel.agentType || "unknown";
     const model = args.model || tel.model || "(default)";
-    const description = args.description || "";
-    const prompt = safeStr(args.prompt);
-    const resultText = safeStr(rawResult);
     const ts = new Date().toISOString();
+
+    // The model's actual output (sync: full answer; background: the dispatch ack).
+    const resultText = resultOutputText(rawResult);
+    // The host strips `prompt`/`description` from toolArgs in both hooks, so recover
+    // the prompt from the result's sessionLog. Fall back to args if ever present.
+    const prompt = safeStr(args.prompt) || extractPromptFromResult(rawResult, resultText);
+    const description = args.description || tel.agentId || "";
 
     const stage = classifyStage({ agentType, description, agentId: tel.agentId, prompt });
     const promptTok = estTokens(prompt);
     const resultTok = estTokens(resultText);
+    const background = (tel.execMode || "").toLowerCase() === "background";
     const isReview = stage === "PLAN_REVIEW" || stage === "CODE_REVIEW";
     const named = isReview ? "review.md" : "plan.md";
+
+    // For a background dispatch the real agent output isn't returned inline (it lands
+    // asynchronously and isn't hookable); flag it so result-token totals aren't
+    // misread as "this stage was nearly free."
+    const resultNote = background ? " (background dispatch — output billed in child ledger)" : "";
 
     const block =
       `# ${stage} — ${ts}\n\n` +
       `- stage: ${stage}\n- model: ${model}\n- agent_type: ${agentType}\n` +
       `- agent_id: ${tel.agentId || "(n/a)"}\n- exec_mode: ${tel.execMode || "(n/a)"}\n` +
       `- description: ${description}\n- status: ${ok ? "success" : "FAILURE"}\n` +
-      `- prompt_tokens_est: ${promptTok}\n- result_tokens_est: ${resultTok}\n` +
+      `- prompt_tokens_est: ${promptTok}\n- result_tokens_est: ${resultTok}${resultNote}\n` +
       (tel.metrics ? `- metrics: ${safeStr(tel.metrics)}\n` : "") +
       `\n## Prompt sent to sub-agent\n\n\`\`\`\n${prompt}\n\`\`\`\n\n` +
-      `## Sub-agent result\n\n${resultText}\n`;
+      `## Sub-agent result\n\n${safeStr(rawResult)}\n`;
 
     writeFileSync(join(dir, named), block);
     appendFileSync(join(dir, "events.log"), `\n${"=".repeat(80)}\n${block}`);
-    timeline(dir, stage, `model=${model} exec=${tel.execMode || "?"} ptok~${promptTok} rtok~${resultTok} status=${ok ? "ok" : "FAIL"} desc="${description}"`);
+    timeline(dir, stage, `model=${model} exec=${tel.execMode || "?"} ptok~${promptTok} rtok~${resultTok}${background ? "(bg)" : ""} status=${ok ? "ok" : "FAIL"} desc="${description}"`);
     metricRow(dir, { stage, model, agentId: tel.agentId, execMode: tel.execMode, promptTok, resultTok, ok });
   } catch (e) {
     debug(dir, `captureTaskCall error: ${e.message}`);
@@ -270,6 +272,14 @@ sub-agents SYNCHRONOUSLY (mode: "sync") so the full result returns inline AND th
 pipeline logger captures each stage's content + token cost to .code-chain/. Parallel
 build WAVES additionally spawn one child SESSION per chunk (each in its OWN worktree)
 so independent chunks build concurrently and merge back — see the build loop below.
+
+CRITICAL — every in-process \`task\` stage (PLAN, PLAN REVIEW, and every width-1
+CODE/CODE_REVIEW/FIX) MUST be dispatched with mode: "sync". NEVER mode: "background"
+for these. A background dispatch returns only an "Agent started…" ack, so the stage's
+real output — and its token cost — is NOT captured in this run's ledger; it also
+forces you to stall waiting for a notification. Sync is both cheaper to observe and
+simpler to act on. Background is ONLY ever correct for spawning parallel child build
+SESSIONS via create_session in a width>1 wave — never for a \`task\` sub-agent stage.
 
 The spec is broken into CHUNKS up front, reviewed ONCE, then each chunk is built,
 reviewed, and fixed in its own short loop before the next chunk starts. Review depth is
@@ -503,28 +513,16 @@ const session = await joinSession({
         return { additionalContext: SKILL_CONTEXT };
       }
     },
-    onPreToolUse: async (input) => {
-      if (shouldYield(input && input.workingDirectory)) return;
-      // Stash intact `task` args (the host strips `prompt`/`description` before the
-      // POST hook). Drained FIFO in onPostToolUse so telemetry recovers them.
-      if (input.toolName === "task") {
-        pushPendingTaskArgs(runDir(input.workingDirectory), input.toolArgs);
-      }
-    },
     onPostToolUse: async (input) => {
       if (shouldYield(input && input.workingDirectory)) return;
       if (input.toolName === "task") {
-        const dir = runDir(input.workingDirectory);
-        const merged = mergeTaskArgs(input.toolArgs, shiftPendingTaskArgs(dir));
-        captureTaskCall(dir, merged, input.toolResult, true);
+        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, input.toolResult, true);
       }
     },
     onPostToolUseFailure: async (input) => {
       if (shouldYield(input && input.workingDirectory)) return;
       if (input.toolName === "task") {
-        const dir = runDir(input.workingDirectory);
-        const merged = mergeTaskArgs(input.toolArgs, shiftPendingTaskArgs(dir));
-        captureTaskCall(dir, merged, { error: safeStr(input.error) }, false);
+        captureTaskCall(runDir(input.workingDirectory), input.toolArgs, { error: safeStr(input.error) }, false);
       }
     },
   },
