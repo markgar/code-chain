@@ -316,35 +316,37 @@ constitution covers. If the spec makes the project's stack/domain clear, OFFER t
 a \`./CONSTITUTION.md\` from that template (filled in from the spec) before planning, so this
 and future runs are grounded — but never block on it; proceed from the spec if declined.
 
-Specify the \`model\` on EVERY task call. Default to "claude-sonnet-4.6" for every
-stage; raise an individual stage to a stronger model only when it clearly warrants it.
-The \`model\` is the authoritative per-phase axis in telemetry (the host strips
-\`description\` from the hook, so the logger classifies stages from result content and
-keys cost by model). Keep the \`description\` strings below for your own readability.
+Specify the \`model\` on EVERY task call — the model is FIXED per stage by ROLE (see
+Fixed model roles below). The \`model\` is the authoritative per-phase axis in telemetry
+(the host strips \`description\` from the hook, so the logger classifies stages from
+result content and keys cost by model). Keep the \`description\` strings below for your
+own readability.
 
-### Model routing by RISK (route intelligence to where it bites)
-Each run designates two model tiers: a CHEAP tier (high-volume builder) and a
-STRONG tier (the oracle and hard reasoner). By DEFAULT both are "claude-sonnet-4.6";
-an experiment may set the CHEAP tier to a budget coder (a flash or mini model) while
-keeping the STRONG tier strong. Route by CHUNK risk, NEVER globally:
-- LOW-RISK chunk (CRUD, wiring, leaf utilities, serialization, boilerplate): the
-  CHEAP tier may BOTH build and review it.
-- HIGH-RISK chunk (money/coupon/discount math, auth or security boundary,
-  concurrency, idempotency, state machines, data migration): the STRONG tier WRITES
-  the code AND the STRONG tier REVIEWS it. A cheap model must NEVER be the sole
-  AUTHOR or the sole REVIEWER of a high-risk chunk — the oracle is never cheaper than
-  the risk it guards.
-This is the entire economic thesis: spend strong-model budget on the dangerous
-MINORITY of chunks; let the cheap tier grind the boilerplate MAJORITY.
+### Fixed model roles (decorrelated author vs reviewer)
+Every run uses three fixed roles, assigned by STAGE, never by chunk:
+- PLANNER  = "claude-opus-4.8" (reasoning medium) — authors the plan, runs ONCE.
+- BUILDER  = "gpt-5.3-codex" — writes EVERY chunk's code, every wave.
+- REVIEWER = "claude-sonnet-4.6" (reasoning high) — reviews EVERY chunk, EVERY
+  integration, and the plan.
+The safety property is DECORRELATION: the BUILDER and REVIEWER are different model
+FAMILIES, so the reviewer RE-DERIVES each rule from the spec instead of sharing the
+coder's blind spots — it catches spec-divergence and concurrency bugs the builder's
+own tests miss. A strong-but-cheap coder grinds all the volume; a different-family
+oracle guards every chunk. This is the entire economic thesis: top-tier reasoning only
+at the PLAN, decorrelated review everywhere, no Opus on the build/review mass.
 
-The PLAN stage is the deliberate EXCEPTION to tier routing: it is authored by the
-strongest planner available ("claude-opus-4.8", reasoning medium) on EVERY run,
-regardless of the cheap/strong tiers chosen for build and review. A plan error — a
-dropped business rule or a wrong high-risk blueprint — is the LEAST RECOVERABLE
-defect in the pipeline: the coder transcribes the blueprint faithfully, and a
-chunk-scoped reviewer never looks for a rule the plan omitted. One Opus call
-upstream is therefore the cheapest, highest-leverage place to spend top-tier
-reasoning. PLAN REVIEW and every build/review stage stay on the tiers above.
+CHUNK RISK still matters — but it tunes PLAN DETAIL and REVIEW DEPTH, NEVER model
+choice. A HIGH-RISK chunk (money/coupon/discount math, auth or security boundary,
+concurrency, idempotency, state machine, data migration) gets (a) its own finer-grained
+chunk with a TRANSCRIBE-READY blueprint so the BUILDER designs nothing, and (b)
+per-TASK review depth — each task's diff reviewed, not just the whole chunk. LOW-RISK
+chunks get a single review pass. The SAME two models are used throughout either way.
+
+WHY Opus only at PLAN: a plan error — a dropped business rule or a wrong high-risk
+blueprint — is the LEAST RECOVERABLE defect in the pipeline: the BUILDER transcribes
+the blueprint faithfully, and a chunk-scoped REVIEWER never looks for a rule the plan
+omitted. One Opus call upstream is therefore the cheapest, highest-leverage place to
+spend top-tier reasoning; every build and review stage stays on the BUILDER/REVIEWER.
 
 ### Loop 1 — PLAN (spec → chunks)
 task({ agent_type: "general-purpose", model: "claude-opus-4.8", reasoning_effort: "medium", mode: "sync",
@@ -352,7 +354,7 @@ task({ agent_type: "general-purpose", model: "claude-opus-4.8", reasoning_effort
        prompt: "FIRST read the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md at the repo root if it exists), and read ./CONSTITUTION.md at the repo root if present to learn the project's tech stack, architecture invariants, and domain constraints. Produce a plan that satisfies every PLANNING tenet AND fits the project's stack/constraints. <Break the task into the FEWEST CHUNKS that still build cleanly. SIZE EACH CHUNK BY RISK, NOT BY FILE. A chunk should be as LARGE as it can be while still (a) leaving the tree GREEN (compiles + its own tests pass), (b) being independently committable, and (c) reviewable in one pass with exactly ONE acceptance check. Do NOT give a leaf utility, pure-function, or single small low-risk file its own chunk — fold low-risk, same-layer, mutually-independent units together into one coherent chunk. CONVERSELY, HIGH-RISK units (security boundary, auth, money/coupon/discount math, data migration, concurrency, idempotency, state machines) get their OWN chunk and may be split FINER so each earns deep review; never bundle a high-risk unit with other work or combine two distinct risk surfaces. For every HIGH-RISK chunk, write a TRANSCRIBE-READY BLUEPRINT so the coder designs NOTHING: give the exact function signatures, the precise formula/algorithm for each business rule (INCLUDING the rounding mode — e.g. ROUND_HALF_UP — and the single money/util helper to call), the spec rule id each piece satisfies, and the exact BOUNDARY cases (half-cent rounding, threshold edges, off-by-one, tie-breaks) its tests must cover. If any high-risk decision (rounding, tie-break, ordering, units, null-handling) is left open, the plan is INCOMPLETE — pin it. For each chunk give: an ordered id/name, the files it touches, a one-line acceptance check (the single test or command that proves it green), the spec rule(s) it satisfies, and its dependencies on earlier chunks. Order chunks so each builds only on earlier ones. Mark HIGH-RISK chunks. Do NOT state a target number of chunks — but prefer consolidation: if two adjacent low-risk chunks could be reviewed together without losing clarity, make them one. THEN compute the dependency graph and GROUP the chunks into ordered WAVES: a wave is a set of chunks that depend ONLY on chunks in EARLIER waves AND touch DISJOINT files, so a wave's chunks can be built in parallel and merged without conflict. Give every chunk an EXCLUSIVE set of OWNED files — no two chunks (especially within the same wave) may write the same file. Engineer this by structure: per-entity model modules, ONE router/module file per chunk, and an auto-include/registration seam so chunks never co-edit a shared app/models/router-registry file; if such shared scaffold is unavoidable, create it ONCE in an early width-1 wave that later waves only import (never edit). Present the plan as ordered WAVES (Wave 1, Wave 2, ...), each listing its chunks (a wave may hold a single chunk), and for each chunk list its OWNED files explicitly. EXPLICITLY name any SHARED or SCAFFOLD files (app entrypoint, models/router registry, conftest, dependency manifest, central config) and the SINGLE Wave-1 chunk that owns each, plus the auto-discovery/registration pattern that lets later chunks add behavior WITHOUT editing those shared files. For an EXISTING (non-greenfield) project, FIRST inspect the current layout: identify every pre-existing file that more than one chunk would need to modify, and either (a) repartition the work so each chunk owns a distinct file or region, or (b) place the colliding chunks in DIFFERENT waves so they never edit that file concurrently — two chunks in the SAME wave must NEVER touch the same file, new or pre-existing.>" })
 
 ### Loop 2 — PLAN REVIEW (review the chunk breakdown ONCE)
-task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
+task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", reasoning_effort: "high", mode: "sync",
        description: "Critique the chunk plan",
        prompt: "CHUNK-PLAN CRITIQUE ONLY — do not write code. Review the plan against the planning rubric at ${PLANNING_DOC} (and ./PLANNING.md if present), the project's ./CONSTITUTION.md if present, AND the spec. Plan: <plan>. Confirm every entity and EVERY business rule maps to a chunk AND to a test inside that chunk, and that the plan fits the project's stack/constraints. For EVERY high-risk chunk, verify the plan PINS the exact formula, signature, rounding mode, tie-break, units, and boundary cases so the coder can TRANSCRIBE with zero open decisions; flag any high-risk chunk whose rule math is left to coder discretion as a BLOCKING plan gap. Flag every rubric or constitution violation: missing requirements, bad ordering, circular-import risk, unnamed seams/contracts, wrong stack/dependency choices, and any high-risk chunk that was not marked. THEN audit chunk SIZING on BOTH ends. TOO SMALL: any low-risk chunk that only adds a leaf utility, pure function, or single small file with no independent risk — name exactly which adjacent chunks to MERGE. TOO BIG: flag a chunk as oversized if ANY of these hold — it lists or needs more than one independent acceptance check; it spans more than one layer or concern; it bundles multiple spec rules that can fail independently; it mixes a HIGH-RISK unit with other work or combines two distinct risk surfaces; or its diff is too large to review in one sitting — for each, name the exact seam to SPLIT on. AUDIT WAVE SAFETY: for each wave, confirm its chunks depend only on EARLIER waves and own DISJOINT files; flag any same-wave shared-file collision (it WILL cause a merge conflict) and prescribe the repartition — split the shared file, add an auto-include seam, or move a chunk to a later wave. Give an explicit chunk-count assessment: are any chunks over-split (merge them) or any high-risk chunk under-split (split it)? Return concrete revisions." })
 Then fold the critique into a FINAL chunk plan before any building.
@@ -366,13 +368,13 @@ until every chunk in the previous wave is merged, green, and committed on YOUR
 #### Width-1 wave (a single chunk) — build IN-PROCESS (cheap, no child session)
 Run the task sub-agents directly on your own worktree:
 
-  CODE (build the chunk) — Model BY RISK: CHEAP tier if this chunk is LOW-RISK, STRONG tier if HIGH-RISK (see "Model routing by RISK").
-  task({ agent_type: "general-purpose", model: "claude-sonnet-4.6", mode: "sync",
+  CODE (build the chunk) — Model: BUILDER ("gpt-5.3-codex"), every chunk regardless of risk.
+  task({ agent_type: "general-purpose", model: "gpt-5.3-codex", mode: "sync",
          description: "Build chunk <id>: <name>",
          prompt: "FIRST read the coding baseline at ${CODING_DOC} (and ./CODING.md at the repo root if it exists) and the project's ./CONSTITUTION.md at the repo root if present, and conform to both. Implement ONLY this chunk: <chunk>. Touch only its OWNED files plus their tests. Commit per logical step with conventional-commit messages. Then run this chunk's acceptance check and report pass/fail. Earlier chunks are already built and committed — do NOT rebuild them. Final chunk plan for context: <final plan>" })
 
-  CODE REVIEW (review THIS chunk's diff only) — Model: STRONG tier (this is the oracle; a HIGH-RISK chunk's reviewer must never be cheaper than its coder).
-  task({ agent_type: "code-review", model: "claude-sonnet-4.6", mode: "sync",
+  CODE REVIEW (review THIS chunk's diff only) — Model: REVIEWER ("claude-sonnet-4.6", reasoning high; a DIFFERENT model family from the BUILDER, so it re-derives from spec rather than sharing the coder's blind spots).
+  task({ agent_type: "code-review", model: "claude-sonnet-4.6", reasoning_effort: "high", mode: "sync",
          description: "Review chunk <id>: <name>",
          prompt: "SPEC-CONFORMANCE REVIEW of ONLY this chunk's diff — \`git diff <wave-base>..HEAD\`. You are given THIS chunk's governing spec rule(s): <chunk spec rules>. For EACH rule, RE-DERIVE the expected behavior and concrete expected VALUES from the spec text YOURSELF — do NOT infer correctness from the code, and do NOT trust the chunk's own tests (they may be written by the same author and can encode the SAME mistake). Pick ADVERSARIAL / BOUNDARY inputs (half-cent rounding, free-shipping/threshold edges, off-by-one stock, empty/null, tie-breaks) and check the code's ACTUAL output against your spec-derived expectation. A rule IMPLEMENTED BUT DIVERGENT from the spec (wrong rounding mode, floor-vs-round, wrong tie-break, wrong unit) is BLOCKING even if every test passes. ALSO check the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present for bugs, races, and constitution violations. Run the chunk's tests, but treat GREEN as necessary-not-sufficient. List issues by severity with concrete fixes; treat security/correctness/spec-divergence/constitution violations as blocking." })
   If blocking issues: dispatch another CODE task to fix them, then re-review.
@@ -388,8 +390,8 @@ worktree branched off YOUR branch:
   this run. For each chunk in the wave:
   create_session({ project_id: "<THIS project's id>", base_branch: "<your current branch>",
      name: "cc W<wave> <id> · <short name>", notify_on_idle: "once", coordinate_with_creator: true,
-     kickoff: { mode: "autopilot", model: "<CHEAP tier if this chunk is LOW-RISK, STRONG tier if HIGH-RISK — see Model routing by RISK>",
-       prompt: "code-chain worker PARENT_RUN=<coord-run-id> — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` with a SPEC-CONFORMANCE review: dispatch a code-review task whose model is the CHEAP tier ONLY if this chunk is LOW-RISK, the STRONG tier if HIGH-RISK (a cheap model must NEVER be the sole reviewer of a high-risk chunk). Hand the reviewer THIS chunk's spec rule(s) and instruct it to RE-DERIVE expected values from the spec, probe BOUNDARY inputs (half-cents, thresholds, off-by-one, tie-breaks), DISTRUST your own tests, and treat any IMPLEMENTED-BUT-DIVERGENT rule as BLOCKING even when tests pass. FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, do BOTH of these as your FINAL steps so your coordinator can detect completion even if a message is missed: (1) write a sentinel at your worktree root — \`printf 'CHUNK <id> tests=<pass|fail> branch=%s\\n' \"\$(git rev-parse --abbrev-ref HEAD)\" > .cc-done\` (do NOT commit it); (2) send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
+     kickoff: { mode: "autopilot", model: "gpt-5.3-codex",
+       prompt: "code-chain worker PARENT_RUN=<coord-run-id> — build EXACTLY ONE chunk and nothing else: <chunk>. Read the coding baseline at ${CODING_DOC} (and ./CODING.md if present) and ./CONSTITUTION.md if present; conform to both. Touch ONLY this chunk's OWNED files plus their tests — NEVER a file owned by another chunk. Commit per logical step (conventional commits). Run the chunk's acceptance check. THEN code-review your OWN diff \`git diff <wave-base>..HEAD\` with a SPEC-CONFORMANCE review: dispatch a code-review task with model \"claude-sonnet-4.6\" and reasoning_effort \"high\" — a DIFFERENT model family from you (the builder), so it re-derives from spec instead of sharing your blind spots. Hand the reviewer THIS chunk's spec rule(s) and instruct it to RE-DERIVE expected values from the spec, probe BOUNDARY inputs (half-cents, thresholds, off-by-one, tie-breaks), DISTRUST your own tests, and treat any IMPLEMENTED-BUT-DIVERGENT rule as BLOCKING even when tests pass. FIX any blocking issue, re-reviewing until green; if this chunk is HIGH-RISK, review per task. Do NOT merge and do NOT touch other chunks' files. When green + committed, do BOTH of these as your FINAL steps so your coordinator can detect completion even if a message is missed: (1) write a sentinel at your worktree root — \`printf 'CHUNK <id> tests=<pass|fail> branch=%s\\n' \"\$(git rev-parse --abbrev-ref HEAD)\" > .cc-done\` (do NOT commit it); (2) send your coordinator EXACTLY this message: 'CHUNK <id> DONE branch=<your branch> tests=<pass|fail>'." } })
   Record each child's chunk id + branch (\`get_session\`). ALSO append each spawned child's
   branch (one per line) to \`.code-chain/latest/children.txt\` on YOUR worktree as you create
   it — this manifest lets the post-run token reconciler attribute child usage to this build
@@ -420,9 +422,9 @@ worktree branched off YOUR branch:
   task) and record it for the final report.
 
   INTEGRATION — after merging the whole wave, dispatch ONE cross-cutting review:
-  task({ agent_type: "code-review", model: "claude-sonnet-4.6", mode: "sync",
+  task({ agent_type: "code-review", model: "claude-sonnet-4.6", reasoning_effort: "high", mode: "sync",
          description: "Integration review wave <n>",
-         prompt: "Review the merged wave diff \`git diff <wave-base>..HEAD\` for CROSS-chunk breakage the isolated per-chunk reviews could not see: import/contract mismatches between chunks, duplicate or colliding registrations, and any spec rule that spans chunks. Run the FULL test suite. Treat security/correctness/contract breakage as blocking. ALSO do SPEC-CONFORMANCE on any rule that spans chunks: re-derive expected values from the spec, probe boundary inputs, and treat implemented-but-divergent (wrong rounding/tie-break/unit) as BLOCKING even if green. For EVERY HIGH-RISK chunk in this wave whose only prior review was a CHEAP-tier self-review, RE-REVIEW its diff here with the STRONG tier — distrust the coder's tests." })
+         prompt: "Review the merged wave diff \`git diff <wave-base>..HEAD\` for CROSS-chunk breakage the isolated per-chunk reviews could not see: import/contract mismatches between chunks, duplicate or colliding registrations, and any spec rule that spans chunks. Run the FULL test suite. Treat security/correctness/contract breakage as blocking. ALSO do SPEC-CONFORMANCE on any rule that spans chunks: re-derive expected values from the spec, probe boundary inputs, and treat implemented-but-divergent (wrong rounding/tie-break/unit) as BLOCKING even if green. For EVERY HIGH-RISK chunk in this wave whose only prior review was a single self-review pass, RE-REVIEW its diff here — distrust the coder's tests." })
   Fix blocking issues with an in-process CODE task before starting the next wave.
 
 #### Session naming convention (keep the tree readable)
@@ -433,12 +435,12 @@ worktree branched off YOUR branch:
 
 ### Rules
 - NEVER write plans or code yourself — every stage is a \`task\` sub-agent or a child session.
-- Specify model + mode "sync" on every task call. Default model "claude-sonnet-4.6".
+- Specify model + mode "sync" on every task call. Models are FIXED by ROLE: PLANNER="claude-opus-4.8" (medium), BUILDER="gpt-5.3-codex", REVIEWER="claude-sonnet-4.6" (high).
 - Planning stages obey PLANNING; coding stages obey CODING; every stage also honors the target project's ./CONSTITUTION.md (stack/domain/invariants) when present. Project-root docs extend the baselines.
 - Review per CHUNK by default, not per file. Escalate to per-task review ONLY for HIGH-RISK chunks.
 - Do NOT anchor a chunk count in any prompt — let the work decide.
 - A clean build does NOT imply correct code: review every chunk; treat dropped requirements / races as blocking.
-- Route model by chunk RISK, never globally: LOW-RISK chunk → the CHEAP tier may both build and review; HIGH-RISK chunk (money/concurrency/idempotency/state/auth/migration) → the STRONG tier BUILDS and the STRONG tier REVIEWS. A cheap model is never the sole author or sole reviewer of a high-risk chunk.
+- Models are assigned by STAGE/ROLE, NEVER by chunk: the BUILDER (gpt-5.3-codex) writes every chunk; the REVIEWER (claude-sonnet-4.6 high) reviews every chunk and integration. Builder and reviewer are DIFFERENT model families on purpose (decorrelation — the reviewer re-derives from spec). Chunk RISK tunes only plan-blueprint detail and review depth (per-task vs per-chunk), not model choice.
 - Reviews are SPEC-CONFORMANCE, not just test-runs: the reviewer is given the chunk's spec rules, RE-DERIVES expected values from the spec, probes boundary inputs, DISTRUSTS the coder's own tests, and treats an implemented-but-spec-divergent rule (wrong rounding, tie-break, unit) as BLOCKING even when all tests pass.
 - For every HIGH-RISK chunk the PLAN must be a transcribe-ready blueprint (exact formula, signature, rounding mode, tie-break, boundary cases); the coder makes NO design decision on a high-risk rule.
 - Process the plan WAVE BY WAVE. Each wave must be merged + green + committed on your branch before the next wave starts. Width-1 waves build IN-PROCESS via task; width>1 waves spawn one CHILD SESSION per chunk and merge back, then get one integration review.
