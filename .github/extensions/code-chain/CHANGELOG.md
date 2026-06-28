@@ -1,5 +1,15 @@
 # code-chain changelog
 
+## v21
+- observability as a first-class build + review concern. CODE stage instruments
+  non-trivial control flow in the same change ("explainable from logs alone");
+  CODE-REVIEW adds an enumerated observability gate (non-success without a reason
+  log, untraced multi-step/cross-service paths, bare-status cross-service calls,
+  level/redaction violations) as a blocking correctness check. Mirrored into the
+  width>1 child-session kickoff. Standard strengthened in CODING.md §6; specifics
+  stay deferred to each target repo's own conventions — no repo-specific logging
+  details hard-coded in the engine.
+
 ## v20
 - fix: include required `name` on all `task()` sub-agent dispatches (host rejected
   calls with `"name": Required`, failing the PLAN stage); add a global rule and
