@@ -1,5 +1,14 @@
 # code-chain changelog
 
+## v22
+- REVIEWER role upgraded from `claude-sonnet-4.6` to `claude-sonnet-5` (reasoning
+  high) across all review stages: plan-critique, per-chunk review-chunk, and
+  integration-review (plus the mirrored width>1 child-session review dispatch).
+  BUILDER (`gpt-5.3-codex`) and PLANNER (`claude-opus-4.8`) unchanged; the
+  builder/reviewer decorrelation property is preserved (different model families).
+  Note: the coordinator/"main" session model is chosen at launch (kickoff), not in
+  the engine — run it on `claude-sonnet-5` via the session kickoff to match.
+
 ## v21
 - observability as a first-class build + review concern. CODE stage instruments
   non-trivial control flow in the same change ("explainable from logs alone");
