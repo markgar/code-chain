@@ -1,5 +1,16 @@
 # code-chain changelog
 
+## v23
+- Logging framed as a REQUIRED DELIVERABLE in the build and review prompts:
+  builders and reviewers are told to assume no human will step through the code
+  with a debugger, so the diagnostic logging must ship in the code itself. The
+  CONCRETE logging mechanism (which logger to import, level meanings, field
+  names, redaction rules) is explicitly deferred to the LOCAL project's own
+  ./CONSTITUTION.md / ./CODING.md — NOT code-chain's docs. The review
+  observability gate now also flags ad-hoc prints or a logger other than the one
+  the local constitution mandates. Applied to build-chunk, review-chunk, the
+  width>1 child-session kickoff mirror, and CODING.md §6.
+
 ## v22
 - REVIEWER role upgraded from `claude-sonnet-4.6` to `claude-sonnet-5` (reasoning
   high) across all review stages: plan-critique, per-chunk review-chunk, and
